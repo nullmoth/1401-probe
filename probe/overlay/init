@@ -1,0 +1,66 @@
+#!/bin/sh
+# 1401 Probe: PID 1. The whole OS is this initramfs: no disk is mounted as root, nothing is installed.
+# PID 1 must never exit (the kernel panics), so every path ends in poweroff or an endless sleep.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/root TERM=linux LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /run /tmp /mnt/usb
+mount -t devpts devpts /dev/pts
+mount -t tmpfs -o mode=0755 tmpfs /run
+mount -t tmpfs tmpfs /tmp
+dmesg -n 3
+
+MODE=full
+for w in $(cat /proc/cmdline); do
+	case "$w" in p1401.mode=*) MODE="${w#p1401.mode=}" ;; esac
+done
+
+# efivarfs read-only: a probe never writes NVRAM (a bad write here has bricked laptops).
+if [ -d /sys/firmware/efi ]; then
+	modprobe -q efivarfs
+	mount -t efivarfs -o ro,nosuid,nodev,noexec efivarfs /sys/firmware/efi/efivars
+fi
+
+say() { echo "$*" >/dev/tty1; }
+say ""
+say "  1401 Probe is starting (mode: $MODE) ..."
+
+if [ "$MODE" = safe ]; then
+	# safe: only what it takes to find the stick and read the machine, no coldplug of every driver
+	modprobe -a -q xhci_pci xhci_hcd ehci_pci ohci_pci uhci_hcd usb_storage uas sd_mod nvme ahci
+else
+	# coldplug without udev: load the driver for every modalias the machine exposes. Three passes,
+	# because a bridge or hub driver exposes new devices. -b honours the blacklist (GPU drivers wait
+	# for the last stage). There are no network, Wi-Fi or Bluetooth drivers in this image to load.
+	for pass in 1 2 3; do
+		find /sys/devices -name modalias -exec cat {} + 2>/dev/null | sort -u | xargs -r modprobe -a -b -q 2>/dev/null
+		sleep 1
+	done
+fi
+modprobe -a -q usb_storage uas sd_mod vfat nls_cp437 nls_iso8859_1 nls_utf8 nls_ascii cpuid msr
+
+W=$(cut -d, -f1 /sys/class/graphics/fb0/virtual_size 2>/dev/null)
+# bigger text on big screens (the default 8x16 font is unreadable at 4K)
+if [ -n "$W" ] && [ "$W" -ge 2500 ]; then /usr/sbin/setfont /usr/share/consolefonts/ter-v32n.psf.gz -C /dev/tty1 2>/dev/null
+elif [ -n "$W" ] && [ "$W" -ge 1600 ]; then /usr/sbin/setfont /usr/share/consolefonts/ter-v24n.psf.gz -C /dev/tty1 2>/dev/null
+fi
+
+if [ "$MODE" = shell ]; then
+	# the shell gets no prompt until every drive on the machine is locked read-only in the kernel
+	python3 /usr/lib/1401-probe/probe.py --lock-disks >/dev/tty1 2>&1 || say "  WARNING: a drive could not be locked read-only (listed above)"
+	say "  Debug shell. Nothing has been scanned. Type 'poweroff -f' to turn off."
+	say "  The scan can be started by hand:  python3 /usr/lib/1401-probe/probe.py"
+	while true; do setsid -c sh </dev/tty1 >/dev/tty1 2>&1; done
+fi
+
+setsid -c python3 -u /usr/lib/1401-probe/probe.py </dev/tty1 >/dev/tty1 2>&1
+RC=$?
+[ "$RC" -ne 0 ] && say "  probe exited with code $RC"
+sync
+umount /mnt/usb 2>/dev/null
+sync
+poweroff -f
+while true; do sleep 3600; done

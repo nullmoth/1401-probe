@@ -1,0 +1,12 @@
+out/
+vendor/
+*.tmp
+windows/Probe/bin/
+windows/Probe/obj/
+incoming/
+site/.build/
+site/.e2e/
+site/.dl/
+# Finder metadata lists folder contents; it never ships
+.DS_Store
+__pycache__/

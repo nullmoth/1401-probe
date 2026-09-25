@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- .NET Framework 4.8 ships inside every Windows 10 (1903+) and 11, so the tester installs no runtime.
+       Built on Linux/macOS in the dotnet SDK container: the reference assemblies come from NuGet, and the
+       WinForms assemblies are plain references (the WindowsDesktop SDK refuses to run off Windows). -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>7.3</LangVersion>
+    <AssemblyName>1401Probe</AssemblyName>
+    <RootNamespace>Probe1401</RootNamespace>
+    <!-- must run 64-bit: a 32-bit process sees SysWOW64, where manage-bde does not exist -->
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Version>1.0.0</Version>
+    <Company>NullMoth Systems</Company>
+    <Authors>NullMoth Systems</Authors>
+    <Copyright>© 2026 NullMoth Systems</Copyright>
+    <Product>1401 Probe</Product>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <!-- no .pdb and no build path baked into the exe: nothing about the build machine ships -->
+    <DebugType>none</DebugType>
+    <PathMap>$(MSBuildProjectDirectory)=C:\NullMoth\1401Probe</PathMap>
+    <Deterministic>true</Deterministic>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- the moth mark from nullmothsystems.com (site/www/assets), shown in the app's banner -->
+    <EmbeddedResource Include="moth-mark.jpg" LogicalName="moth-mark.jpg" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Management" />
+    <Reference Include="System.Web.Extensions" />
+  </ItemGroup>
+</Project>
