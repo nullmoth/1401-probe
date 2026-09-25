@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1401 Probe Instructions</title>
+<!-- Same look as nullmothsystems.com (site/www/assets/site.css): black, dark purple, Times/Courier/Verdana, bevels,
+     cyan = "it worked". Self-contained: opened from disk, so no external fonts, scripts or images. -->
+<style>
+:root {
+  --bg: #000; --panel: #0b0613; --panel-2: #150a24; --line: #3b1f5f; --hi: #8b5cc8; --lo: #13081f;
+  --text: #e6ddf3; --muted: #a898c2; --purple: #b98aff; --link: #c9a3ff; --cyan: #58e6ea; --err: #ff7092;
+  --serif: "Times New Roman", Times, "Liberation Serif", serif;
+  --mono: "Courier New", Courier, "Liberation Mono", monospace;
+  --sans: Verdana, Geneva, Tahoma, "DejaVu Sans", sans-serif;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 18px/1.5 var(--serif); }
+.wrap { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+.banner { border: 3px ridge var(--hi); background: var(--panel-2); padding: 14px 16px; text-align: center; }
+.banner h1 { margin: 0; font: bold 30px/1.1 var(--serif); letter-spacing: 0.12em; color: var(--purple); }
+.banner p { margin: 6px 0 0; font: 14px var(--mono); color: var(--cyan); letter-spacing: 0.08em; }
+h2 { font: bold 22px var(--serif); color: var(--purple); margin: 28px 0 8px; border-bottom: 2px groove var(--hi); padding-bottom: 4px; }
+ol, ul { padding-left: 1.4em; }
+li { margin: 0 0 10px; }
+.panel { background: var(--panel); border: 2px solid; border-color: var(--hi) var(--lo) var(--lo) var(--hi); padding: 12px 16px; margin: 12px 0; }
+.warn { border-color: var(--err); border-style: solid; border-width: 2px; }
+.warn b { color: var(--err); }
+.ok { color: var(--cyan); }
+code, kbd { font: 16px var(--mono); background: #000; border: 1px inset var(--hi); padding: 0 4px; }
+table { border-collapse: collapse; font: 15px var(--sans); margin: 8px 0; }
+td { border: 1px solid var(--line); padding: 4px 10px; }
+a { color: var(--link); }
+.small { font: 13px var(--sans); color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="banner">
+    <h1>NULLMOTH SYSTEMS</h1>
+    <p>1401 PROBE · HARDWARE SCANNER · HOW TO USE IT</p>
+  </div>
+
+  <p>1401 Probe scans your computer's hardware from a USB stick and saves one report. You upload the report at
+  <b>nullmothsystems.com</b>, and that tells us exactly what your hardware needs. It takes about 15 minutes.</p>
+
+  <div class="panel">
+    <b>You need:</b> a USB stick of 1 GB or more that you don't need anything on (it gets erased), and this PC.
+  </div>
+
+  <h2>1 · Make the stick (in Windows)</h2>
+  <ol>
+    <li>Open <b>1401 Probe</b> and click <b>Make the scanner USB stick</b>.</li>
+    <li>The app checks this PC. If <b>Secure Boot</b> is on, you'll turn it off in step 2. If <b>BitLocker</b> is on, click
+      <b>Pause BitLocker for 3 restarts</b>. Otherwise Windows will ask for your recovery key after you change Secure Boot.</li>
+    <li>Plug in the USB stick, pick it in the list, tick the box, and click <b>Erase and make the stick</b>.
+      Only USB drives are listed. Your internal drives are never shown.</li>
+  </ol>
+
+  <h2>2 · Start the scanner</h2>
+  <ol>
+    <li>If Secure Boot is on: click <b>Restart into BIOS setup</b>, find <b>Secure Boot</b> (usually under Boot or
+      Security), set it to <b>Disabled</b>, then save and exit. The scanner isn't signed by Microsoft, so it can't start
+      while Secure Boot is on.</li>
+    <li>Leave the stick plugged in. Press the <b>boot-menu key</b> as the PC starts, and pick the USB stick marked
+      <b>UEFI</b>. You can also click <b>Restart now and pick the USB stick</b> in the app and choose <b>Use a device</b>.
+      <table>
+        <tr><td>ASUS <kbd>F8</kbd></td><td>MSI <kbd>F11</kbd></td><td>Gigabyte <kbd>F12</kbd></td><td>ASRock <kbd>F11</kbd></td></tr>
+        <tr><td>Dell <kbd>F12</kbd></td><td>HP <kbd>F9</kbd></td><td>Lenovo <kbd>F12</kbd></td><td>Acer <kbd>F12</kbd></td></tr>
+      </table>
+    </li>
+    <li>Choose <b>1401 Probe - scan this computer</b> (it starts by itself after 5 seconds).</li>
+  </ol>
+
+  <h2>3 · Let it scan</h2>
+  <ul>
+    <li>The scan takes about 2 to 8 minutes. The last step is a <b>graphics test</b>. The screen may flicker or go black for
+      up to 3 minutes. That's normal, so leave it running.</li>
+    <li>When it says <b class="ok">DONE</b>, the report is saved on the stick and the computer <b>turns itself off</b>.</li>
+    <li>If nothing happens for 5 minutes, hold the power button. Your report is already saved up to that point.
+      To try again, pick <b>safe scan</b> at the menu. It skips the graphics test, so use it only if the normal scan froze.</li>
+  </ul>
+
+  <div class="panel warn">
+    <b>4 · Put your settings back</b>
+    <ol>
+      <li>Turn the computer on and go into BIOS setup (usually <kbd>Del</kbd> or <kbd>F2</kbd> as it starts).
+        Set <b>Secure Boot</b> back to <b>Enabled</b>, then save and exit.</li>
+      <li>Start Windows and open 1401 Probe. The <b>Find my report</b> page checks Secure Boot and BitLocker for you and
+        offers to turn BitLocker back on.</li>
+      <li>Your boot order was not changed. The boot menu is a one-time choice.</li>
+    </ol>
+  </div>
+
+  <h2>5 · Upload the report</h2>
+  <ol>
+    <li>In 1401 Probe, click <b>I already scanned - find my report</b>, then <b>Show both files</b>.</li>
+    <li>Click <b>Open the upload page</b> (<b>nullmothsystems.com</b>) and <b>drag both files</b> onto it:
+      the <code>.zip</code> and the <code>.txt</code> with the same name, from the stick's <code>REPORTS</code> folder.</li>
+    <li>It prints a report ID like <code>NM-XXXXXXXX</code>. Keep it: that's how we find your report if we have a question.
+      That's it, and thank you.</li>
+  </ol>
+
+  <h2>What the scanner does and never does</h2>
+  <ul>
+    <li><span class="ok">Reads:</span> processor, motherboard, BIOS/UEFI settings, graphics cards, Wi-Fi and Bluetooth chips,
+      sound, USB ports, drive models and sizes, and firmware tables.</li>
+    <li><span class="ok">Writes:</span> one report, to its own stick only.</li>
+    <li><b>Never</b> connects to the internet. It has no network, Wi-Fi or Bluetooth drivers.</li>
+    <li><b>Never</b> reads, opens or changes your drives. Every drive except its own stick is locked read-only before
+      the scan starts.</li>
+    <li><b>Never</b> changes BIOS/UEFI settings.</li>
+    <li><b>Removes</b> serial numbers, UUIDs, MAC addresses and your Windows key from the report. Open the .zip and
+      look. It's all plain text or raw firmware dumps.</li>
+  </ul>
+
+  <p class="small">Done with the stick? In 1401 Probe, <b>Find my report</b>, then <b>Make it an ordinary USB drive again</b>.
+  Latest version and how-to: <b>nullmothsystems.com/probe</b> · Free software, GPL-3.0-or-later: LICENSE.txt, GPL-3.0.txt · Source: <b>nullmothsystems.com/source</b> · Open-source parts: THIRD-PARTY-NOTICES.txt · © 2026 NullMoth Systems</p>
+</div>
+</body>
+</html>

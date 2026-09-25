@@ -1,0 +1,66 @@
+1401 PROBE - LICENSE
+NullMoth Systems · nullmothsystems.com
+Version 2, 25 September 2026
+
+Copyright © 2026 NullMoth Systems.
+
+1401 Probe is free software: you can redistribute it and/or modify it under the terms of the GNU
+General Public License as published by the Free Software Foundation, either version 3 of the License,
+or (at your option) any later version. The full text of the GPL is in GPL-3.0.txt, installed next to
+this file and copied onto every scanner stick. This page says what that means in plain words and what
+the tool does to your computer. Where this page and the GPL differ, the GPL wins.
+
+1. WHAT 1401 PROBE IS
+   1401 Probe is a free tool from NullMoth Systems. It has two parts:
+     - a Windows app that turns a USB stick into a hardware scanner, and
+     - the scanner itself, a small offline system that starts from that stick, reads what hardware
+       your computer has, and saves one report (a .zip file and a .txt summary) to the stick.
+
+2. WHAT YOU MAY DO WITH IT
+   Use it on as many computers as you like and make as many scanner sticks as you like, for free.
+   Read the source code, change it, and share copies, changed or not, under this same license. If you
+   give someone a copy you changed or built yourself, give them its source code and this license too,
+   as the GPL describes. The source code of every version NullMoth Systems publishes is at
+   nullmothsystems.com/source.
+
+3. WHAT IT DOES TO YOUR COMPUTER
+   - The Windows app ERASES the USB stick you choose, after asking you twice. It only lists USB
+     drives, never the drive Windows runs from.
+   - The scanner never connects to the internet. It contains no network, Wi-Fi or Bluetooth drivers.
+   - The scanner never reads, mounts or changes your internal drives. Before it scans anything it
+     tells the system to treat every drive except its own stick as read-only.
+   - The scanner never changes your BIOS/UEFI settings. You change Secure Boot yourself, and the
+     app reminds you to turn it back on afterwards.
+   - If you choose to, the app pauses BitLocker for 3 restarts. It resumes by itself, and the app
+     offers to resume it straight away once you are done.
+
+4. YOUR REPORT
+   The report stays on your USB stick. Nothing is sent anywhere unless you upload it yourself at
+   nullmothsystems.com. The scanner removes serial numbers, UUIDs, MAC addresses and your Windows
+   product key before it saves the report. You can open the .zip and read everything in it before
+   you send it. What happens to an uploaded report is described at nullmothsystems.com/privacy.
+
+5. NO WARRANTY
+   1401 Probe is provided "as is", without warranty of any kind, express or implied, including
+   fitness for a particular purpose (GPL sections 15 and 16). Starting a computer from a USB stick
+   and testing its graphics driver can, in rare cases, freeze the computer until you hold the power
+   button. To the extent the law allows, NullMoth Systems is not liable for any damage or loss
+   arising from the use of 1401 Probe. Back up anything important on the USB stick before you use
+   it, because it will be erased.
+
+6. OTHER PEOPLE'S SOFTWARE
+   The scanner is built from open-source software (the Linux kernel, GRUB, BusyBox, Python, Alpine
+   Linux packages, and hardware firmware files), each under its own license. Those licenses, not
+   this one, govern those parts, and nothing here limits your rights under them. The full list,
+   with each license and where to get the source code, is in THIRD-PARTY-NOTICES.txt, installed
+   next to this file and copied onto every scanner stick. The Windows installer is made with NSIS
+   (zlib license).
+
+7. THE NULLMOTH NAME AND MOTH LOGO ARE NOT LICENSED
+   The GPL covers 1401 Probe's software and nothing else. The names "NullMoth" and "NullMoth
+   Systems" and the moth logo (the app icon and moth-mark.jpg) are © 2026 NullMoth Systems, all
+   rights reserved. They are not part of the GPL-licensed work, and no trademark rights are granted
+   (GPL-3.0 section 7(e)). Unmodified copies may carry them exactly as shipped. A modified version
+   must drop them and must never present itself as NullMoth's. NVIDIA, AMD, Intel, Microsoft,
+   Windows and other product names belong to their owners and are used only to describe hardware
+   and software this tool works with.

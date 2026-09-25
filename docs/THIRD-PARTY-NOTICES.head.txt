@@ -1,0 +1,23 @@
+1401 PROBE - THIRD-PARTY NOTICES
+NullMoth Systems · nullmothsystems.com
+
+The 1401 Probe scanner is built from the open-source software listed below. Each part is licensed by its
+own authors under the license shown, and nothing in the 1401 Probe license limits your rights under those
+licenses. The scanner uses these packages unmodified, exactly as Alpine Linux publishes them.
+
+WHERE TO GET THE SOURCE CODE
+  - Alpine Linux packages: https://gitlab.alpinelinux.org/alpine/aports (branch 3.24-stable) and the
+    source archives each package's APKBUILD names. Binary packages: https://dl-cdn.alpinelinux.org/alpine/v3.24/
+  - Linux kernel (Alpine "linux-lts" package): https://git.kernel.org and the aports tree above.
+  - GRUB 2 (GPL-3.0-or-later), the boot menu, is built from Alpine's "grub-efi" package: same aports tree.
+  - Hardware firmware (linux-firmware 20260519, only the NVIDIA, AMD, Intel graphics files): redistributable
+    under the terms in its WHENCE and LICENSE.* files. Their full texts ride on the stick in licenses/linux-firmware/
+    (in the install folder: payload\licenses\linux-firmware\),
+    https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git
+  - Written offer: for three years from the date you received this copy, NullMoth Systems will provide
+    the complete corresponding source code of every GPL-licensed part of this scanner, on request through
+    nullmothsystems.com, for no more than the cost of providing it.
+
+THE WINDOWS APP AND INSTALLER
+  - The installer is made with NSIS (https://nsis.sourceforge.io), zlib/libpng license.
+  - The app runs on Microsoft .NET Framework 4.8, which is part of Windows. No copy of it is included.
