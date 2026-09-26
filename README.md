@@ -43,6 +43,9 @@ NM_ALLOW_NO_PRIVATE=1 ./build.sh all
 - `out/windows/1401-Probe-Setup.exe`: the Windows app and installer
 
 `NM_ALLOW_NO_PRIVATE=1` skips one release check that only the maintainer's machine can run.
+The first build makes a seal key at `~/.config/nullmoth/seal/<version>.key` (your own; reports from your build are
+sealed with it). `NM_ALLOW_NO_SEAL=1` builds without one, and its reports say `"sealed": false`.
+What changed in each version: `CHANGELOG.md`.
 `./test/qemu-test.sh` boots the real stick image on an emulated PC and fails if a planted serial number survives
 into the report, if any network interface appears, or if the emulated SSD changes by one byte (it needs QEMU with
 UEFI firmware).

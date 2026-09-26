@@ -33,6 +33,11 @@ EOF
 MT() { docker run --rm --platform linux/amd64 -v "$PWD/$T":/t alpine:3.24 sh -c "apk add -q mtools >/dev/null && $1"; }
 MT 'mcopy -o -i /t/stick.img@@1M /t/grub.cfg ::/boot/grub/grub.cfg && mdir -b -i /t/stick.img@@1M ::/boot/grub'
 MT 'mformat -i /t/nvme.img -v PROBE1401 -F :: && echo decoy > /t/1401-probe.marker && mcopy -i /t/nvme.img /t/1401-probe.marker :: && mdir -i /t/nvme.img ::'
+# a planted freeze: the step file a hard hang inside one device's decode would leave behind on THIS machine (its id is
+# the hash of the -smbios model fields below), plus one from another machine that must be ignored
+MID=$(python3 -c 'import hashlib;print(hashlib.sha256(b"ProbeTest|QEMU-1401|ProbeBoards|TEST-B860|TEST-BIOS-1").hexdigest()[:12])')
+printf '%s stage:pci\n%s pci-decode:0000:00:1f.3\n000000000000 stage:cpu\n' "$MID" "$MID" > "$T/.probe-step"
+MT 'mcopy -o -i /t/stick.img@@1M /t/.probe-step ::/REPORTS/.probe-step && mdir -a -b -i /t/stick.img@@1M ::/REPORTS'  # REPORTS ships on the stick
 NVME0=$(shasum -a 256 "$T/nvme.img" | cut -d' ' -f1); STICK0=$(shasum -a 256 "$T/stick.img" | cut -d' ' -f1)
 
 echo "== booting (limit ${LIMIT}s)"
@@ -44,6 +49,7 @@ qemu-system-x86_64 -machine q35 -cpu max -smp 2 -m 4096 \
 	-drive if=none,id=nv0,format=raw,file="$T/nvme.img" -device nvme,drive=nv0,serial=SECRETNVME456 \
 	-netdev user,id=n0,restrict=on -device e1000e,netdev=n0,mac=52:54:00:12:34:56 \
 	-device intel-hda -device hda-duplex \
+	-smbios type=0,vendor=ProbeBIOS,version=TEST-BIOS-1 \
 	-smbios type=1,manufacturer=ProbeTest,product=QEMU-1401,serial=SECRETSYS789,uuid=5ec2e7aa-1111-2222-3333-444455556666 \
 	-smbios type=2,manufacturer=ProbeBoards,product=TEST-B860,serial=SECRETBOARD000 \
 	-display none -monitor none -serial file:"$T/serial.log" -no-reboot &
@@ -58,9 +64,10 @@ done
 echo "QEMU exited after $(( $(date +%s) - t0 ))s"
 NVME1=$(shasum -a 256 "$T/nvme.img" | cut -d' ' -f1); STICK1=$(shasum -a 256 "$T/stick.img" | cut -d' ' -f1)
 
-MT 'mcopy -n -i /t/stick.img@@1M "::/REPORTS/*" /t/reports/ ; ls -la /t/reports'
+MT 'mcopy -n -i /t/stick.img@@1M "::/REPORTS/*" /t/reports/ ; mcopy -n -i /t/stick.img@@1M ::/REPORTS/.probe-step ::/REPORTS/.probe-skip /t/reports/ ; ls -la /t/reports'
+VERSION=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' probe/overlay/usr/lib/1401-probe/probe.py)
 
-T="$T" NVME0="$NVME0" NVME1="$NVME1" STICK0="$STICK0" STICK1="$STICK1" python3 - <<'EOF'
+MID="$MID" KF="${NM_SEAL_KEYFILE:-$HOME/.config/nullmoth/seal/$VERSION.key}" T="$T" NVME0="$NVME0" NVME1="$NVME1" STICK0="$STICK0" STICK1="$STICK1" python3 - <<'EOF'
 import glob, json, os, sys, zipfile
 T = os.environ["T"]
 fails = []
@@ -137,6 +144,34 @@ nv = [d for d in rep.get("storage", {}).get("disks", []) if d.get("name") == "nv
 check("the drive list marks nvme0n1 locked and not the stick", nv and nv[0].get("locked") == "read-only" and not nv[0].get("is_probe_stick"), nv)
 gp = rep.get("gpus", [])
 check("the QEMU display adapter went through the GPU stage", len(gp) >= 1, [(g.get("vendor"), g.get("device")) for g in gp])
+
+# freeze memory: the planted step is blamed, skipped, remembered; the other machine's line is not
+meta = rep.get("meta", {})
+check("the planted freeze is read back as this machine's innermost step", meta.get("previous_run_froze_at") == ["pci-decode:0000:00:1f.3"],
+      meta.get("previous_run_froze_at"))
+vvv = z.read(root + "/pci/lspci-vvv.txt").decode("utf-8", "replace")
+check("   ... that one device's decode is skipped and says so", "0000:00:1f.3 [1401-probe] skipped" in vvv)
+dec = [l.split()[0] for l in vvv.splitlines() if l.startswith("0000:") and "[1401-probe]" not in l]
+check("   ... every other device is still decoded", len(dec) >= 5 and "0000:00:1f.3" not in dec, len(dec))
+check("   ... another computer's leftover step skipped nothing", "stage:cpu" not in meta.get("skipping", []), meta.get("skipping"))
+sp = open(T + "/reports/.probe-step").read() if os.path.exists(T + "/reports/.probe-step") else None
+check("   ... the step file is empty after a clean finish", sp == "", repr(sp))
+sk = open(T + "/reports/.probe-skip").read() if os.path.exists(T + "/reports/.probe-skip") else ""
+check("   ... and the skip is remembered for the next run", os.environ["MID"] + " pci-decode:0000:00:1f.3" in sk, repr(sk))
+
+# seal: verifies with the build key; a changed byte does not
+import hashlib, hmac
+sj = json.loads(z.read(root + "/seal.json"))
+man = {n[len(root) + 1:]: hashlib.sha256(z.read(n)).hexdigest() for n in names if not n.endswith("/") and n != root + "/seal.json"}
+check("seal.json lists exactly the files in the zip, with their hashes", sj.get("files") == man,
+      sorted(set(sj.get("files", {})) ^ set(man))[:5])
+key = bytes.fromhex(open(os.environ["KF"]).readline().strip()) if os.path.exists(os.environ["KF"]) else b""
+mac = lambda f: hmac.new(key, (sj.get("name", "") + "\n" + "".join("%s  %s\n" % (f[k], k) for k in sorted(f))).encode(), hashlib.sha256).hexdigest()
+check("the report is sealed and the seal verifies with this version's key", bool(key) and sj.get("mac") == mac(man),
+      "no key file" if not key else sj.get("key_id"))
+check("   ... the seal names this report", sj.get("name") == meta.get("name"), sj.get("name"))
+bad = dict(man); k0 = sorted(bad)[0]; bad[k0] = "0" * 64
+check("   ... and one changed file fails it (negative control)", sj.get("mac") != mac(bad))
 print("\n%s  (%d files, %.1f MB zip)" % ("ALL PASSED" if not fails else "%d FAILED" % len(fails), len(names),
                                          os.path.getsize(zips[0]) / 1e6))
 sys.exit(1 if fails else 0)

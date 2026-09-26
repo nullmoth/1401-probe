@@ -104,6 +104,13 @@ python3 probe/image/trim.py firmware "$V" "$R" "$F/lib/firmware" "$R/lib/firmwar
 say "overlay"
 cp -a probe/overlay/. "$R/"
 chmod 0755 "$R/init" "$R/usr/lib/1401-probe/probe.py"
+if [ -n "${NM_SEAL_KEY:-}" ]; then
+	echo "$NM_SEAL_KEY" | grep -Eqx '[0-9a-f]{64}' || { echo "error: NM_SEAL_KEY is not 64 hex digits"; exit 1; }
+	echo "$NM_SEAL_KEY" > "$R/usr/lib/1401-probe/seal.key"
+	echo "  seal key: in (not printed)"
+else
+	echo "  seal key: NONE - reports from this image say sealed: false"
+fi
 mkdir -p "$R/dev" "$R/proc" "$R/sys" "$R/run" "$R/tmp" "$R/mnt/usb" "$R/root"
 mknod -m 600 "$R/dev/console" c 5 1
 mknod -m 666 "$R/dev/null" c 1 3
