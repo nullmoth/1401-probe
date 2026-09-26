@@ -5,8 +5,18 @@ NullMoth (the NVIDIA Metal driver).
 It runs once, as the only program on the live USB stick, reads the machine, and writes one zip to
 the stick. It never mounts an internal drive, never writes NVRAM (efivarfs is mounted read-only),
 never writes a device register, and the image it runs in carries no network drivers at all.
-The one device-side toggle is the kernel's own: writing "1" to a sysfs `rom` file lets the kernel
-map the expansion ROM for the duration of each read, which is the documented way to read a VBIOS.
+Two device-side toggles, both put back right after the read: writing "1" to a sysfs `rom` file lets
+the kernel map the expansion ROM (the documented way to read a VBIOS), and a GPU the firmware left
+with memory decode off (every laptop dGPU so far) gets the decode bit of its PCI command register
+set for the length of the ROM and BOOT register reads, then its original command word back.
+
+Freeze-proof. Before each step that touches hardware, the step's name is written to the stick. If
+the machine hard-freezes there, the next boot from the same stick finds the name, records it, and
+skips that one step, so a second run gets past it and we learn exactly what froze.
+
+Sealed. Official builds carry a per-version key and every checkpoint writes seal.json: the SHA-256
+of every file in the report plus an HMAC over that list. A build from source has no key and writes
+an unsealed report, which is still a complete report.
 
 Raw first. The stick records raw truth (VBIOS, CPUID, MSRs, ACPI, PCI config, USB port
 topology). Interpretation lives in reader/read_probe.py on our side, so a better reader never
@@ -18,9 +28,12 @@ report is already saved.
 
 Selftest (pure functions, runs anywhere): python3 probe.py --selftest
 """
+import contextlib
 import ctypes
 import fcntl
 import glob
+import hashlib
+import hmac
 import json
 import mmap
 import os
@@ -36,12 +49,15 @@ import time
 import traceback
 import zipfile
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 SCHEMA = "1401-probe/1"
 STICK_LABEL = "PROBE1401"
 MARKER = "1401-probe.marker"
 MNT = "/mnt/usb"
 WORK = "/run/probe"
+SEAL_KEY = "/usr/lib/1401-probe/seal.key"   # official builds only; see build.sh
+STEP_FILE = ".probe-step"   # in REPORTS/: the hardware steps running right now, one per line
+SKIP_FILE = ".probe-skip"   # in REPORTS/: steps that froze a previous run on this stick
 EFI_GLOBAL = "8be4df61-93ca-11d2-aa0d-00e098032b8c"
 OC_VENDOR = "4d1fda02-38c7-4a6a-9cc6-4bcca8b30102"   # OpenCore's own variables: an existing OpenCore install shows here
 APPLE_BOOT = "7c436110-ab2a-4bbb-a880-fe41995c9f82"  # boot-args / csr-active-config live under Apple's boot GUID
@@ -431,6 +447,7 @@ def checkpoint():
     redact_tree()
     save("report.json", REP)  # carries the redaction counts; itself redacted on the next pass
     redact_tree()
+    seal()  # last: it hashes the files exactly as they will be zipped
     if not STICK:
         return False
     d = os.path.join(MNT, "REPORTS")
@@ -453,6 +470,115 @@ def checkpoint():
     except OSError as e:
         REP.setdefault("errors", []).append("checkpoint: %s" % e)
         return False
+
+
+def seal_manifest(root):
+    files = {}
+    for r, _, fs in os.walk(root):
+        for fn in fs:
+            p = os.path.join(r, fn)
+            rel = os.path.relpath(p, root)
+            if rel == "seal.json":
+                continue
+            with open(p, "rb") as f:
+                files[rel] = hashlib.sha256(f.read()).hexdigest()
+    return files
+
+
+def seal_mac(key, name, files):
+    msg = name + "\n" + "".join("%s  %s\n" % (files[k], k) for k in sorted(files))
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def seal():
+    """seal.json: the SHA-256 of every file as it leaves this machine, and an HMAC over that list and the
+    report's name. The key never goes into the report; key_id (a hash of the key) only says which one to use."""
+    try:
+        key = bytes.fromhex(rd(SEAL_KEY) or "")
+    except ValueError:
+        key = b""
+    files = seal_manifest(OUT)
+    s = {"format": 1, "name": NAME, "files": files}
+    if key:
+        s["key_id"] = hashlib.sha256(b"1401-seal-id" + key).hexdigest()[:16]
+        s["mac"] = seal_mac(key, NAME, files)
+    else:
+        s["sealed"] = False  # built from source: no key in this image
+    save("seal.json", s)
+
+
+# Freeze memory. A stage timeout catches a hung program, never a hung machine: on 2026-09-26 a desktop froze
+# solid inside the PCI stage and the report kept only the three stages before it, with no clue which device did it.
+ACTIVE = []      # hardware steps running right now, oldest first
+SKIP = set()     # steps that froze a previous run on this computer
+SKIPPED = []     # steps this run skipped because of that
+STEP_LOCK = threading.Lock()
+MACHINE = ""
+
+
+def machine_id():
+    """Model-level identity (no serials): a stick moved to another computer must not skip that computer's steps."""
+    k = "|".join(rd("/sys/class/dmi/id/" + f) or "" for f in ("sys_vendor", "product_name", "board_vendor", "board_name", "bios_version"))
+    return hashlib.sha256(k.encode()).hexdigest()[:12]
+
+
+def write_steps():
+    if not STICK:
+        return
+    try:
+        with open(os.path.join(MNT, "REPORTS", STEP_FILE), "w") as f:
+            f.write("".join("%s %s\n" % (MACHINE, t) for t in ACTIVE))
+            f.flush()
+            os.fsync(f.fileno())  # a hard freeze keeps what fsync already pushed to the flash
+    except OSError as e:
+        if not REP.get("step_file_error"):
+            REP["step_file_error"] = str(e)
+
+
+@contextlib.contextmanager
+def step(tag):
+    """Run one hardware step under its name. Yields False, and records it, when this step froze a previous run."""
+    if tag in SKIP:
+        with STEP_LOCK:
+            SKIPPED.append(tag)
+        yield False
+        return
+    with STEP_LOCK:
+        ACTIVE.append(tag)
+        write_steps()
+    try:
+        yield True
+    finally:
+        with STEP_LOCK:
+            if tag in ACTIVE:
+                ACTIVE.remove(tag)
+            write_steps()
+
+
+def load_steps():
+    """A step file that is not empty means the last run on this stick never came back from those steps.
+    The innermost steps are blamed; a stage is blamed only when nothing inside it was running."""
+    d = os.path.join(MNT, "REPORTS")
+    mine = lambda txt: [l.split(" ", 1)[1] for l in (txt or "").splitlines() if l.startswith(MACHINE + " ") and " " in l]
+    left = mine(rd(os.path.join(d, STEP_FILE)))
+    old = mine(rd(os.path.join(d, SKIP_FILE)))
+    froze = [t for t in left if not t.startswith("stage:")] or left
+    SKIP.update(old + froze)
+    if froze:
+        REP["meta"]["previous_run_froze_at"] = froze
+        keep = [l for l in (rd(os.path.join(d, SKIP_FILE)) or "").splitlines() if l.strip()]
+        keep += ["%s %s" % (MACHINE, t) for t in froze]
+        try:
+            with open(os.path.join(d, SKIP_FILE), "w") as f:
+                f.write("\n".join(keep[-100:]) + "\n")  # bounded: one stick, a handful of machines
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError as e:
+            REP.setdefault("errors", []).append("skip file: %s" % e)
+    if SKIP:
+        REP["meta"]["skipping"] = sorted(SKIP)
+    write_steps()  # clears the file for this run
+    return froze
 
 
 # --------------------------------------------------------------------------------------------- stages
@@ -724,31 +850,51 @@ def parse_resource(txt):
 
 
 def st_pci():
-    sh("pci/lspci-vvv.txt", ["lspci", "-nnvvv", "-D"], 60)
-    sh("pci/lspci-xxx.txt", ["lspci", "-nnD", "-xxx"], 60)  # 256 B each: extended space (DSN) stays out
-    sh("pci/lspci-tree.txt", ["lspci", "-tvnn"], 30)
+    # The header-only listings first: make_name() already ran the same reads before any stage, so they are known
+    # safe on this machine. The full decode (every capability, VPD) runs per device afterwards, each under its own
+    # step name, because one of those froze a whole machine on 2026-09-26 and took the entire stage with it.
     names = parse_lspci_vmm(sh("pci/lspci-vmm.txt", ["lspci", "-vmm", "-nn", "-D", "-k"], 30))
+    sh("pci/lspci-tree.txt", ["lspci", "-tvnn"], 30)
     devs = []
     for bdf in sorted(os.listdir("/sys/bus/pci/devices")):
-        p = "/sys/bus/pci/devices/" + bdf
-        real = os.path.realpath(p)
-        n = names.get(bdf, {})
-        d = {"bdf": bdf, "vendor": rd(p + "/vendor"), "device": rd(p + "/device"),
-             "subsystem_vendor": rd(p + "/subsystem_vendor"), "subsystem_device": rd(p + "/subsystem_device"),
-             "class": rd(p + "/class"), "revision": rd(p + "/revision"), "driver": rdlink(p + "/driver"),
-             "vendor_name": strip_id(n.get("Vendor")), "device_name": strip_id(n.get("Device")),
-             "sdevice_name": strip_id(n.get("SDevice")), "class_name": strip_id(n.get("Class")),
-             "iommu_group": rdlink(p + "/iommu_group"), "numa_node": rd(p + "/numa_node"), "boot_vga": rd(p + "/boot_vga"),
-             "power_state": rd(p + "/power_state"), "link": {k: rd(p + "/" + k) for k in (
-                 "current_link_speed", "current_link_width", "max_link_speed", "max_link_width")},
-             "label": rd(p + "/label"), "acpi_index": rd(p + "/acpi_index"),
-             "acpi_path": rd(p + "/firmware_node/path"), "acpi_hid": rd(p + "/firmware_node/hid"),
-             "oc_path": oc_path(real), "sysfs": real.replace("/sys/devices/", ""),
-             "bars": parse_resource(rd(p + "/resource")),
-             "rebar": {os.path.basename(f): rd(f) for f in sorted(glob.glob(p + "/resource*_resize"))}}
-        devs.append(d)
+        with step("pci-sysfs:" + bdf) as go:
+            if go:
+                devs.append(pci_device(bdf, names))
+            else:
+                devs.append({"bdf": bdf, "skipped": "this read froze a previous run"})
     REP["pci"] = devs
     save("pci/devices.json", devs)
+    checkpoint()  # every device's IDs, BARs and paths are on the stick before any full decode runs
+    vvv, xxx = [], []
+    for d in devs:
+        with step("pci-decode:" + d["bdf"]) as go:
+            if not go:
+                vvv.append("%s [1401-probe] skipped: decoding this device froze a previous run\n\n" % d["bdf"])
+                continue
+            vvv.append(sh(None, ["lspci", "-nnvvv", "-D", "-s", d["bdf"]], 20))
+            xxx.append(sh(None, ["lspci", "-nnD", "-xxx", "-s", d["bdf"]], 20))  # 256 B: extended space (DSN) stays out
+    save("pci/lspci-vvv.txt", "".join(vvv))
+    save("pci/lspci-xxx.txt", "".join(xxx))
+
+
+def pci_device(bdf, names):
+    p = "/sys/bus/pci/devices/" + bdf
+    real = os.path.realpath(p)
+    n = names.get(bdf, {})
+    d = {"bdf": bdf, "vendor": rd(p + "/vendor"), "device": rd(p + "/device"),
+         "subsystem_vendor": rd(p + "/subsystem_vendor"), "subsystem_device": rd(p + "/subsystem_device"),
+         "class": rd(p + "/class"), "revision": rd(p + "/revision"), "driver": rdlink(p + "/driver"),
+         "vendor_name": strip_id(n.get("Vendor")), "device_name": strip_id(n.get("Device")),
+         "sdevice_name": strip_id(n.get("SDevice")), "class_name": strip_id(n.get("Class")),
+         "iommu_group": rdlink(p + "/iommu_group"), "numa_node": rd(p + "/numa_node"), "boot_vga": rd(p + "/boot_vga"),
+         "power_state": rd(p + "/power_state"), "link": {k: rd(p + "/" + k) for k in (
+             "current_link_speed", "current_link_width", "max_link_speed", "max_link_width")},
+         "label": rd(p + "/label"), "acpi_index": rd(p + "/acpi_index"),
+         "acpi_path": rd(p + "/firmware_node/path"), "acpi_hid": rd(p + "/firmware_node/hid"),
+         "oc_path": oc_path(real), "sysfs": real.replace("/sys/devices/", ""),
+         "bars": parse_resource(rd(p + "/resource")),
+         "rebar": {os.path.basename(f): rd(f) for f in sorted(glob.glob(p + "/resource*_resize"))}}
+    return d
 
 
 def st_usb():
@@ -994,6 +1140,28 @@ def nv_boot_regs(bdf):
     return {"pmc_boot_0": hx(boot0, 8), "pmc_boot_42": hx(boot42, 8)}
 
 
+@contextlib.contextmanager
+def memory_decode(bdf):
+    """Laptop dGPUs come up with memory decode off (the firmware only enables the boot display). Then the ROM
+    reads back as 0xFF, which the kernel answers with EIO, and BAR0 cannot be read: five of five laptops in the
+    first uploads. Set the decode bit of the PCI command register for the length of the reads, then write the
+    original command word back. Yields the original word when it had to switch decode on, else None."""
+    p = "/sys/bus/pci/devices/%s/config" % bdf
+    cfg = rd(p, binary=True, limit=64) or b""
+    res = (rd("/sys/bus/pci/devices/%s/resource" % bdf) or "").split()
+    if len(cfg) < 6 or struct.unpack_from("<H", cfg, 4)[0] & 0x2 or not res or int(res[0], 16) == 0:
+        yield None  # already on, or BAR0 never got an address (then decode would claim nothing)
+        return
+    before = struct.unpack_from("<H", cfg, 4)[0]
+    fd = os.open(p, os.O_RDWR)
+    try:
+        os.pwrite(fd, struct.pack("<H", before | 0x2), 4)
+        yield before
+    finally:
+        os.pwrite(fd, struct.pack("<H", before), 4)
+        os.close(fd)
+
+
 def st_gpu_raw():
     gpus = []
     for d in REP.get("pci", []):
@@ -1003,20 +1171,33 @@ def st_gpu_raw():
         g = {k: d.get(k) for k in ("bdf", "vendor", "device", "subsystem_vendor", "subsystem_device", "revision", "class",
                                    "vendor_name", "device_name", "sdevice_name", "boot_vga", "link", "acpi_path", "oc_path",
                                    "bars", "rebar", "iommu_group", "power_state")}
-        cfg = rd("/sys/bus/pci/devices/%s/config" % bdf, binary=True, limit=4096)
-        if cfg:
-            save("gpu/%s/config.bin" % bdf, zero_pcie_dsn(cfg))
-        rom, err = read_rom(bdf)
-        if rom:
-            save("gpu/%s/vbios.rom" % bdf, rom)
-            g["vbios"] = dict(size=len(rom), **rom_images(rom))
-        else:
-            g["vbios"] = {"error": err}
+        with step("gpu-config:" + bdf) as go:
+            cfg = rd("/sys/bus/pci/devices/%s/config" % bdf, binary=True, limit=4096) if go else None
+            if cfg:
+                save("gpu/%s/config.bin" % bdf, zero_pcie_dsn(cfg))  # the command word as the firmware left it
+        with step("gpu-rom:" + bdf) as go:
+            if not go:
+                g["vbios"] = {"error": "skipped: reading this ROM froze a previous run"}
+            else:
+                with memory_decode(bdf) as was:
+                    rom, err = read_rom(bdf)
+                if was is not None:
+                    g["decode_switched_on"] = hx(was)
+                if rom:
+                    save("gpu/%s/vbios.rom" % bdf, rom)
+                    g["vbios"] = dict(size=len(rom), **rom_images(rom))
+                else:
+                    g["vbios"] = {"error": err}
         if d.get("vendor") == "0x10de":
-            try:
-                g["nv"] = nv_boot_regs(bdf)
-            except Exception as e:  # noqa: BLE001 - the error goes into the report
-                g["nv"] = {"error": "%s: %s" % (type(e).__name__, e)}
+            with step("gpu-regs:" + bdf) as go:
+                if not go:
+                    g["nv"] = {"skipped": "reading BOOT_0 froze a previous run"}
+                else:
+                    try:
+                        with memory_decode(bdf):
+                            g["nv"] = nv_boot_regs(bdf)
+                    except Exception as e:  # noqa: BLE001 - the error goes into the report
+                        g["nv"] = {"error": "%s: %s" % (type(e).__name__, e)}
         gpus.append(g)
     fb = {k: rd("/sys/class/graphics/fb0/" + k) for k in ("name", "virtual_size", "stride", "bits_per_pixel")}
     REP["gpus"] = gpus
@@ -1046,12 +1227,16 @@ def st_gpu_drivers():
         if vid not in vendors:
             continue
         UI.say("    loading %s ..." % first)
-        tried.append(first)
-        sh("kernel/modprobe-%s.txt" % first, ["modprobe", first], 150)
+        with step("driver:" + first) as go:
+            tried.append(first if go else first + " (skipped: it froze a previous run)")
+            if go:
+                sh("kernel/modprobe-%s.txt" % first, ["modprobe", first], 150)
         unbound = [g["bdf"] for g in REP["gpus"] if g.get("vendor") == vid and not rdlink("/sys/bus/pci/devices/%s/driver" % g["bdf"])]
         if unbound and second:
-            tried.append(second)
-            sh("kernel/modprobe-%s.txt" % second, ["modprobe", second], 150)
+            with step("driver:" + second) as go:
+                tried.append(second if go else second + " (skipped: it froze a previous run)")
+                if go:
+                    sh("kernel/modprobe-%s.txt" % second, ["modprobe", second], 150)
     time.sleep(6)  # connectors are probed asynchronously after the driver binds
     sh("kernel/dmesg-2-after-gpu-drivers.txt", ["dmesg"], 20)
     conns = []
@@ -1080,15 +1265,48 @@ def st_gpu_drivers():
                 ips.setdefault(blk, "%s.%s.%s" % (rd(f), rd(os.path.dirname(f) + "/minor"), rd(os.path.dirname(f) + "/revision")))
             info["ip_discovery"] = ips
         cards.append(info)
-    for d in sorted(glob.glob("/sys/kernel/debug/dri/*")):
+    errors = {}
+    for d in debugfs_dirs(sorted(glob.glob("/sys/kernel/debug/dri/*"))):
+        base = os.path.basename(d)
+        try:
+            listing = sorted(os.listdir(d))
+        except OSError as e:
+            listing, errors[base] = [], str(e)
+        # every name, so a file we do not keep yet (or one a driver moved) still shows up in the report
+        save("gpu/debugfs/dri%s-files.txt" % base, "\n".join(listing) + "\n")
         for f in DEBUGFS_KEEP:
-            src = os.path.join(d, f)
-            if os.path.exists(src):
-                data = rd(src, binary=True, limit=32 << 20)
-                if data:
-                    ext = ".bin" if f in ("amdgpu_discovery", "i915_vbt", "i915_opregion", "amdgpu_vbios") else (".rom" if f.endswith(".rom") else ".txt")
-                    save("gpu/debugfs/dri%s-%s%s" % (os.path.basename(d), f.replace(".rom", ""), ext), data)
-    REP["gpu_drivers"] = {"tried": tried, "cards": cards, "connectors": conns}
+            if f not in listing:
+                continue
+            try:
+                with open(os.path.join(d, f), "rb") as fh:
+                    data = fh.read(32 << 20)
+            except OSError as e:
+                errors["%s/%s" % (base, f)] = str(e)  # v1.0.0 dropped these silently; nouveau's vbios.rom was one
+                continue
+            if not data:
+                errors["%s/%s" % (base, f)] = "empty"
+                continue
+            ext = ".bin" if f in ("amdgpu_discovery", "i915_vbt", "i915_opregion", "amdgpu_vbios") else (".rom" if f.endswith(".rom") else ".txt")
+            save("gpu/debugfs/dri%s-%s%s" % (base, f.replace(".rom", ""), ext), data)
+    try:
+        top = sorted(os.listdir("/sys/kernel/debug"))
+    except OSError:
+        top = []
+    for t in list(top):
+        if t.startswith("nouveau"):  # GSP-RM logs live here on newer kernels; names only
+            for r, ds, fs in os.walk("/sys/kernel/debug/" + t):
+                top += [os.path.relpath(os.path.join(r, x), "/sys/kernel/debug") for x in ds + fs]
+                if r.count("/") > 5:
+                    ds[:] = []
+    save("gpu/debugfs/top-files.txt", "\n".join(top) + "\n")
+    REP["gpu_drivers"] = {"tried": tried, "cards": cards, "connectors": conns, "debugfs_errors": errors}
+
+
+def debugfs_dirs(dirs):
+    """This kernel shows each device three times: dri/<pci address>, dri/<N> and dri/<128+N>. Read it once, by
+    address; the numbered ones are only used on a kernel that has no address directories."""
+    named = [d for d in dirs if ":" in os.path.basename(d)]
+    return named or [d for d in dirs if os.path.basename(d).isdigit() and int(os.path.basename(d)) < 128]
 
 
 # --------------------------------------------------------------------------------------------- flow
@@ -1146,12 +1364,22 @@ def summary():
     L.append("Network   : %s (interfaces: %s)" % ("OFFLINE" if net.get("offline") else "WARNING: NOT OFFLINE", ", ".join(net.get("interfaces", []))))
     bad = ["%s=%s" % (k, v["status"]) for k, v in REP.get("stages", {}).items() if v["status"] != "ok"]
     L.append("Stages    : %s" % ("all ok" if not bad else ", ".join(bad)))
+    if REP["meta"].get("previous_run_froze_at"):
+        L.append("Last run  : froze at %s (skipped this time)" % ", ".join(REP["meta"]["previous_run_froze_at"]))
+    if SKIPPED:
+        L.append("Skipped   : %s" % ", ".join(SKIPPED))
     L.append("Saved as  : REPORTS/%s.zip" % NAME if STICK else "Saved as  : NOT SAVED (the USB stick was not found)")
     return "\n".join(L) + "\n"
 
 
 def run_stage(i, n, title, key, fn, timeout):
     UI.say(" [%2d/%d] %-44s" % (i, n, title), end="")
+    if "stage:" + key in SKIP:
+        SKIPPED.append("stage:" + key)
+        REP["stages"][key] = {"status": "skipped", "seconds": 0, "error": "this stage froze the previous run on this computer"}
+        UI.say("SKIPPED (it froze last time)")
+        checkpoint()
+        return
     lock_disks()
     t0 = time.monotonic()
     box = {}
@@ -1165,8 +1393,9 @@ def run_stage(i, n, title, key, fn, timeout):
             box["tb"] = traceback.format_exc()
 
     th = threading.Thread(target=body, daemon=True)
-    th.start()
-    th.join(timeout)
+    with step("stage:" + key):  # a hung thread times out below; a hung machine leaves this name on the stick
+        th.start()
+        th.join(timeout)
     dt = round(time.monotonic() - t0, 1)
     if th.is_alive():
         st = {"status": "timeout", "seconds": dt, "error": "still running after %ds" % timeout}
@@ -1199,7 +1428,7 @@ def make_name():
 
 
 def main():
-    global CMDLINE, MODE, OUT, NAME, STICK, UI, STICK_DONE
+    global CMDLINE, MODE, OUT, NAME, STICK, UI, STICK_DONE, MACHINE
     CMDLINE = rd("/proc/cmdline") or ""
     m = re.search(r"p1401\.mode=(\w+)", CMDLINE)
     MODE = m.group(1) if m else "full"
@@ -1218,13 +1447,21 @@ def main():
     STICK_DONE = True
     lock_disks()
     UI.say("ok" if STICK else "NOT FOUND - the report will only be shown on screen")
+    MACHINE = machine_id()
+    if STICK:
+        froze = load_steps()
+        if froze:
+            UI.say("")
+            UI.say("  The last scan on this computer stopped at: %s" % ", ".join(froze))
+            UI.say("  That step is skipped this time, so the scan can finish.")
+            UI.say("")
     NAME = make_name()
     OUT = os.path.join(WORK, NAME)
     os.makedirs(OUT, exist_ok=True)
     REP["meta"]["name"] = NAME
     REP["meta"]["stick"] = bool(STICK)
     stages = [("Firmware and boot mode", "meta", st_meta, 20), ("Computer and motherboard", "dmi", st_dmi, 40),
-              ("Processor (CPUID, MSRs)", "cpu", st_cpu, 180), ("PCI devices", "pci", st_pci, 120),
+              ("Processor (CPUID, MSRs)", "cpu", st_cpu, 180), ("PCI devices", "pci", st_pci, 180),
               ("USB controllers and ports", "usb", st_usb, 90), ("ACPI tables", "acpi", st_acpi, 90),
               ("UEFI firmware", "efi", st_efi, 60), ("Drives (identity only)", "storage", st_storage, 60),
               ("Audio, input, sensors", "misc", st_misc, 150), ("Graphics cards (VBIOS)", "gpu_raw", st_gpu_raw, 120),
@@ -1244,8 +1481,9 @@ def main():
         UI.say("  Your report is saved. Last step: a graphics-driver test.")
         UI.say("  The screen may flicker or go black for up to 3 minutes. The computer turns itself off when done.")
         UI.say("  If nothing happens for 5 minutes, hold the power button. Your report is already saved.")
-        # No skip key: the graphics-driver stage is the data NullMoth needs most. The only way
-        #   around it is the "safe scan" boot entry, for a machine where the normal scan froze.
+        UI.say("  Then start the stick again: it skips the step that froze.")
+        # No skip key: the graphics-driver stage is the data NullMoth needs most. A freeze here is
+        #   remembered on the stick, so the next run skips only the driver that froze (step "driver:<name>").
         UI.countdown(20, "Starting in (any key starts now)")
         run_stage(total, total, "Graphics drivers (connectors, firmware)", "gpu_drivers", st_gpu_drivers, 420)
     elif MODE == "full":
@@ -1387,6 +1625,70 @@ def selftest():
     check("no USB candidate means no blkid at all (a bare blkid reads every internal disk)", label_argv([]) is None)
     a = label_argv(["/dev/sdb", "/dev/sdb1"])
     check("   ... and with candidates blkid is limited to exactly them", a is not None and a[-2:] == ["/dev/sdb", "/dev/sdb1"], str(a))
+
+    # seal: a report sealed here verifies with the key; one changed byte or one added file does not
+    global NAME, SEAL_KEY, MNT, STICK, MACHINE
+    NAME = "SELFTEST"
+    kf = os.path.join(tempfile.mkdtemp(), "seal.key")
+    key = bytes(range(32))
+    with open(kf, "w") as f:
+        f.write(key.hex() + "\n")
+    SEAL_KEY = kf
+    seal()
+    sj = json.load(open(os.path.join(OUT, "seal.json")))
+    check("a sealed report verifies against its own files and the build key",
+        sj.get("mac") == seal_mac(key, NAME, seal_manifest(OUT)) and "seal.json" not in sj["files"], str(sorted(sj)))
+    with open(os.path.join(OUT, "x/mac.txt"), "ab") as f:
+        f.write(b"!")
+    check("   ... one byte changed after sealing breaks it", sj["mac"] != seal_mac(key, NAME, seal_manifest(OUT)))
+    seal()
+    sj = json.load(open(os.path.join(OUT, "seal.json")))
+    save("x/extra.txt", "added later\n")
+    check("   ... one file added after sealing breaks it", sj["mac"] != seal_mac(key, NAME, seal_manifest(OUT)))
+    check("   ... and a renamed report breaks it", sj["mac"] != seal_mac(key, "OTHER", sj["files"]))
+    SEAL_KEY = os.path.join(os.path.dirname(kf), "missing.key")
+    seal()
+    sj = json.load(open(os.path.join(OUT, "seal.json")))
+    check("a build without a key says sealed: false and carries no mac", sj.get("sealed") is False and "mac" not in sj, str(sorted(sj)))
+
+    # freeze memory, on a fake stick in a temp dir (never a real one)
+    MNT = tempfile.mkdtemp()
+    os.makedirs(os.path.join(MNT, "REPORTS"))
+    STICK = "/dev/selftest"
+    MACHINE = "aaaaaaaaaaaa"
+    REP["meta"] = {}
+    with step("stage:pci"):
+        with step("pci-sysfs:0000:01:00.0"):
+            left = open(os.path.join(MNT, "REPORTS", STEP_FILE)).read()
+    check("a running step is on the stick while it runs", left == "aaaaaaaaaaaa stage:pci\naaaaaaaaaaaa pci-sysfs:0000:01:00.0\n", repr(left))
+    check("   ... and gone when it returns", open(os.path.join(MNT, "REPORTS", STEP_FILE)).read() == "")
+    with open(os.path.join(MNT, "REPORTS", STEP_FILE), "w") as f:
+        f.write(left + "bbbbbbbbbbbb gpu-rom:0000:02:00.0\n")
+    froze = load_steps()
+    check("after a freeze the innermost step is blamed, not its stage", froze == ["pci-sysfs:0000:01:00.0"], str(froze))
+    check("   ... another computer's leftover step is ignored", "gpu-rom:0000:02:00.0" not in SKIP, str(sorted(SKIP)))
+    ran = []
+    with step("pci-sysfs:0000:01:00.0") as go:
+        ran.append(go)
+    with step("pci-sysfs:0000:00:02.0") as go:
+        ran.append(go)
+    check("   ... that step is skipped on the next run, its neighbours still run", ran == [False, True], str(ran))
+    check("   ... and the skip is kept on the stick for the run after", "aaaaaaaaaaaa pci-sysfs:0000:01:00.0" in open(os.path.join(MNT, "REPORTS", SKIP_FILE)).read())
+    SKIP.clear()
+    with open(os.path.join(MNT, "REPORTS", STEP_FILE), "w") as f:
+        f.write("aaaaaaaaaaaa stage:usb\n")
+    froze = load_steps()
+    check("a freeze with only a stage running blames the stage", froze == ["stage:usb"] and "stage:usb" in SKIP, str(froze))
+    SKIP.clear()
+    del SKIPPED[:]
+    STICK = None
+
+    # debugfs: one directory per device
+    check("debugfs is read once per device, by PCI address",
+        debugfs_dirs(["/d/dri/0", "/d/dri/0000:01:00.0", "/d/dri/128"]) == ["/d/dri/0000:01:00.0"])
+    check("   ... and by number (below 128) on a kernel without address directories",
+        debugfs_dirs(["/d/dri/0", "/d/dri/1", "/d/dri/128", "/d/dri/129"]) == ["/d/dri/0", "/d/dri/1"])
+
     print("\n%d failed" % len(fails) if fails else "\nall checks passed")
     return 1 if fails else 0
 

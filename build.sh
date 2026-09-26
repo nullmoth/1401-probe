@@ -20,8 +20,23 @@ if [ -z "$NM_PRIVATE_RE" ] && [ "${NM_ALLOW_NO_PRIVATE:-}" != 1 ]; then
 	echo "error: no private name patterns at $PF: the leak scans cannot run (NM_ALLOW_NO_PRIVATE=1 only on CI)"; exit 1
 fi
 export NM_PRIVATE_RE
+# the seal key: one per release, kept outside this repo (the same key must verify every report that version makes).
+# A report the probe seals can be checked by whoever holds the key; a build without one writes "sealed": false.
+# No key means no build, unless NM_ALLOW_NO_SEAL=1 says so (a source build that will never be published).
+VERSION=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' probe/overlay/usr/lib/1401-probe/probe.py)
+KF=${NM_SEAL_KEYFILE:-$HOME/.config/nullmoth/seal/$VERSION.key}
+if [ ! -f "$KF" ] && [ "${NM_ALLOW_NO_SEAL:-}" != 1 ] && [ -z "${NM_SEAL_KEYFILE:-}" ]; then
+	mkdir -p "$(dirname "$KF")" && chmod 700 "$(dirname "$KF")"
+	(umask 077; od -An -tx1 -N32 /dev/urandom | tr -d ' \n' > "$KF"; echo >> "$KF")
+	echo "  new seal key for $VERSION at $KF"
+fi
+NM_SEAL_KEY=$(head -n 1 "$KF" 2>/dev/null || true)
+if [ -z "$NM_SEAL_KEY" ] && [ "${NM_ALLOW_NO_SEAL:-}" != 1 ]; then
+	echo "error: no seal key at $KF (NM_ALLOW_NO_SEAL=1 builds an unsealed image)"; exit 1
+fi
+export NM_SEAL_KEY
 if [ "$what" = image ] || [ "$what" = all ]; then
-	docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work -e NM_PRIVATE_RE "$ALPINE" sh probe/image/build-inside.sh
+	docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work -e NM_PRIVATE_RE -e NM_SEAL_KEY "$ALPINE" sh probe/image/build-inside.sh
 fi
 if [ "$what" = windows ] || [ "$what" = all ]; then
 	[ -f out/usb/boot/initramfs.zst ] || { echo "error: build the image first: ./build.sh image"; exit 1; }
