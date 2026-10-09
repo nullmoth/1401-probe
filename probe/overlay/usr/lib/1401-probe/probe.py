@@ -52,7 +52,7 @@ import time
 import traceback
 import zipfile
 
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 SCHEMA = "1401-probe/1"
 STICK_LABEL = "PROBE1401"
 MARKER = "1401-probe.marker"
@@ -858,8 +858,13 @@ def st_pci():
     # The header-only listings first: make_name() already ran the same reads before any stage, so they are known
     # safe on this machine. The full decode (every capability, VPD) runs per device afterwards, each under its own
     # step name, because one of those froze a whole machine on 2026-09-26 and took the entire stage with it.
-    names = parse_lspci_vmm(sh("pci/lspci-vmm.txt", ["lspci", "-vmm", "-nn", "-D", "-k"], 30))
-    sh("pci/lspci-tree.txt", ["lspci", "-tvnn"], 30)
+    # the listings are their own step: a freeze in them used to blame the whole stage, and every later run then
+    # skipped all of PCI and reported no GPU at all (a Ryzen 5800H + RTX 3060 laptop on 2.0.1)
+    names = {}
+    with step("pci-list") as go:
+        if go:
+            names = parse_lspci_vmm(sh("pci/lspci-vmm.txt", ["lspci", "-vmm", "-nn", "-D", "-k"], 30))
+            sh("pci/lspci-tree.txt", ["lspci", "-tvnn"], 30)
     devs = []
     for bdf in sorted(os.listdir("/sys/bus/pci/devices")):
         with step("pci-sysfs:" + bdf) as go:
@@ -1992,8 +1997,17 @@ def st_trace():
         if drv and (cls.startswith("0x03") or cls == "0x0403"):
             devs.append((os.path.basename(d), drv, cls))
     for bdf, drv, cls in devs:
+        # the HDMI audio function of an NVIDIA card that is not the boot display sits powered down with its GPU on a
+        # hybrid laptop; re-binding it hung two RTX 4050 laptops on 2.0.1 for good. It carries no display data.
+        gpu_fn = bdf[:-1] + "0"
+        if cls == "0x0403" and (rd("/sys/bus/pci/devices/%s/vendor" % bdf) or "") == "0x10de" and not boot_vga(gpu_fn):
+            tr["errors"]["%s-%s" % (drv, bdf)] = "skipped: HDMI audio of a GPU that is not the boot display"
+            continue
         UI.say("    tracing %s on %s ..." % (drv, bdf))
-        run("%s-%s" % (drv, bdf.replace(":", "_")), lambda bdf=bdf, drv=drv: (pci_rebind(bdf, drv), time.sleep(8)))
+        # every re-bind is under the dead-man: a driver that wedges the machine ends in poweroff, and the next boot
+        # skips this one step instead of the user holding the power button (2.0.1 covered only modprobe and NVIDIA's)
+        with deadman(150, "trace %s %s" % (drv, bdf)):
+            run("%s-%s" % (drv, bdf.replace(":", "_")), lambda bdf=bdf, drv=drv: (pci_rebind(bdf, drv), time.sleep(8)))
 
     nv = [g for g in REP.get("gpus", []) if g.get("vendor") == "0x10de"]
     packs = os.path.join(MNT, "drivers")

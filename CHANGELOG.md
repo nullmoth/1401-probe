@@ -2,6 +2,14 @@
 
 Every release stays up, on nullmothsystems.com/probe and on the GitHub releases page, with its SHA-256.
 
+## 2.0.2 - 2026-10-09
+
+- **No more freezes in the last step on laptops.** Every driver test in the last step now runs under the same
+  automatic power-off as the graphics test: if one hangs, the PC turns itself off and the next start skips it.
+  The HDMI audio of an NVIDIA card that is not driving the screen is no longer tested; it hung RTX 4050 laptops.
+- **A freeze while listing PCI devices no longer loses the graphics card.** Before, every later scan skipped all of
+  PCI and the report had no GPU in it.
+
 ## 2.0.1 - 2026-10-09
 
 Fixes the errors some of you saw on 2.0.0. If you made a 2.0.0 stick, make it again with 2.0.1.
