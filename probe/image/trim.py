@@ -4,12 +4,15 @@
   trim.py modules <src_moddir> <dst_moddir>     copy the kernel modules minus every network path
   trim.py firmware <kver> <moddir> <fw_src> <fw_dst>   copy exactly the firmware the GPU drivers ask for
   trim.py linkage <root> <control_lib> <control_bin>   every ELF's libraries resolve inside the image
+  trim.py radios <kroot> <kver> <fw_src> <stage>       the OPT-IN radio pack: the deleted Wi-Fi/BT/Ethernet drivers
+                                                       + their firmware, kept OUT of the image (drivers/ on the stick)
 
 Offline by construction. The image cannot reach a network because no driver for one exists in it:
 every Ethernet, Wi-Fi, Bluetooth, USB-net, Thunderbolt-net, FireWire-net, InfiniBand and modem driver
 and the whole kernel/net tree is deleted here. The runtime check (only `lo` may exist) and the QEMU test
 (an e1000e card is present and no interface appears) prove it from the other side.
 """
+import json
 import os
 import re
 import shutil
@@ -161,6 +164,73 @@ def firmware(kver, moddir_root, src, dst):
     print("firmware total: %.1f MiB" % (total / 1048576))
 
 
+# the device drivers the opt-in radio trace may load; their cores (cfg80211, mac80211, bluetooth, libphy, ...)
+# come in through modules.dep. None of this is in the image: the probe unpacks it only after the user says yes.
+RADIO = ("kernel/drivers/net/wireless/", "kernel/drivers/net/ethernet/", "kernel/drivers/net/usb/",
+         "kernel/drivers/bluetooth/")
+
+
+def newest_ucode(names, present):
+    """iwlwifi (and others) list every firmware API they speak, newest first in the driver's own search. Keep
+    the newest present file per prefix: the driver loads exactly that one, the rest is dead weight on the stick."""
+    best, out = {}, []
+    for n in names:
+        m = re.match(r"^(.*)-(\d+)\.ucode$", n)
+        if m and present(n):
+            k = m.group(1)
+            if int(m.group(2)) > best.get(k, (-1, None))[0]:
+                best[k] = (int(m.group(2)), n)
+        elif not m:
+            out.append(n)
+    return out + [n for _, n in best.values()]
+
+
+def radios(kroot, kver, fw_src, stage):
+    src = os.path.join(kroot, "lib/modules", kver)
+    deps = {}
+    with open(os.path.join(src, "modules.dep")) as f:
+        for line in f:
+            k, _, v = line.partition(":")
+            deps[k.strip()] = v.split()
+    top = sorted(m for m in deps if m.startswith(RADIO))
+    want, todo = set(), list(top)
+    while todo:
+        m = todo.pop()
+        if m not in want:
+            want.add(m)
+            todo.extend(deps.get(m, []))
+    # only what the image deleted: everything else these need is already in the image
+    ship = sorted(m for m in want if denied(m))
+    for m in ship:
+        d = os.path.join(stage, "modules", m)
+        os.makedirs(os.path.dirname(d), exist_ok=True)
+        shutil.copy2(os.path.join(src, m), d)
+    got = miss = size = 0
+    fdst = os.path.join(stage, "firmware")
+
+    def present(n):
+        return any(os.path.lexists(os.path.join(fw_src, c)) for c in (n + ".zst", n, n + ".xz"))
+    for m in top:
+        names = subprocess.run(["modinfo", "-b", kroot, "-k", kver, "-F", "firmware", os.path.join(src, m)],
+                               capture_output=True, text=True).stdout.split()
+        for n in newest_ucode(names, present):
+            for cand in (n + ".zst", n, n + ".xz"):
+                b = materialize(fw_src, fdst, cand)
+                if b is not None:
+                    got += 1
+                    size += b
+                    break
+            else:
+                miss += 1
+    with open(os.path.join(stage, "pack.json"), "w") as f:
+        json.dump({"name": "radios-" + kver, "kind": "radios", "kernel": kver,
+                   "drivers": [modname(m) for m in top], "modules": len(ship)}, f)
+    print("radio pack: %d driver modules (+%d cores), firmware %d files %.1f MiB (%d named but absent)"
+          % (len(top), len(ship) - len([m for m in ship if m in top]), got, size / 1048576, miss))
+    if not any(modname(m) == "cfg80211" for m in ship) or not any(modname(m) == "btusb" for m in ship):
+        sys.exit("error: radio pack has no cfg80211 or btusb: the Wi-Fi/Bluetooth trace could load nothing")
+
+
 def elf_deps(path):
     """(interpreter, [DT_NEEDED], [RPATH/RUNPATH dirs]) of a 64-bit little-endian ELF executable or shared
     object; None for anything else (kernel modules are ET_REL and carry no dynamic section)."""
@@ -276,5 +346,7 @@ if __name__ == "__main__":
         firmware(*sys.argv[2:6])
     elif sys.argv[1] == "linkage":
         linkage(*sys.argv[2:5])
+    elif sys.argv[1] == "radios":
+        radios(*sys.argv[2:6])
     else:
         sys.exit(__doc__)

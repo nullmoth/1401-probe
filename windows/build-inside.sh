@@ -42,8 +42,13 @@ scan() {  # prints the count of identifying strings in $1, never the strings: a 
 	# Alpine builds every package as user "buildozer", and its GRUB (payload/EFI/BOOT/BOOTX64.EFI) carries 335
 	# "/home/buildozer/aports/main/grub/src/..." source paths. That is Alpine's builder, not ours. Any other
 	# /home/ or /Users/ path still counts.
-	printf '%s\n' "$s" | sed 's#/home/buildozer/##g' \
-	  | grep -c -i -E "/Users/|/home/|\.pdb${NM_PRIVATE_RE:+|$NM_PRIVATE_RE}" || true
+	# names match in any case; paths and the debug-symbol extension match as they are really spelled. WAS one -i over
+	# all of it: NVIDIA's 580 driver blob (payload/drivers) holds the random bytes ".Pdb", which is no symbol path.
+	s=$(printf '%s\n' "$s" | sed 's#/home/buildozer/##g')
+	local p n=0
+	p=$(printf '%s\n' "$s" | grep -c -E "/Users/|/home/|\.pdb|\.PDB" || true)
+	[ -z "${NM_PRIVATE_RE:-}" ] || n=$(printf '%s\n' "$s" | grep -c -i -E "$NM_PRIVATE_RE" || true)
+	echo $((p + n))
 }
 n=0
 while IFS= read -r -d '' f; do

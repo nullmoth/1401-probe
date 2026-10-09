@@ -2,6 +2,27 @@
 
 Every release stays up, on nullmothsystems.com/probe and on the GitHub releases page, with its SHA-256.
 
+## 2.0.0 - 2026-10-08
+
+The probe now maps the whole machine, down to how each driver talks to its hardware, so the installer can build the
+right setup for your exact PC.
+
+- **Full system map.** Which GPU drives each screen and the laptop panel, switchable-graphics hints, GPU features
+  (architecture, CUDA level, RT and tensor cores), PCIe slots, memory modules (no serials), storage ports and modes
+  (AHCI/RAID/VMD), fans and sensors, USB roles (Bluetooth, camera, RGB, fingerprint), touchpad and keyboard bus,
+  CPU core layout, IOMMU and the firmware memory map.
+- **Build report.** The stick also writes a `Report.json` in the format the EFI builder reads (collector from
+  Hardware-Sniffer, BSD-3).
+- **Driver trace.** At the end, each graphics and audio driver is restarted while the kernel records every register
+  read and write it makes. NVIDIA cards get NVIDIA's own driver for their generation, carried on the stick:
+  open 610 for Turing and newer, 580 for Maxwell/Pascal/Volta (Kepler and older: nouveau for now).
+  The screen may go black for a few minutes during this step.
+- **Wi-Fi, Bluetooth and Ethernet: your choice.** The stick still has no network drivers in it. At the start it asks
+  (default: no). If you press Y, it loads only the drivers for your own chips, records them starting, switches each
+  radio off the moment it appears, and removes the drivers again. Nothing is configured or sent.
+- Traces are redacted like the rest of the report (including a network chip's address as it appears in its
+  registers) and capped at 40 MB.
+
 ## 1.0.1 - 2026-09-26
 
 Fixes from the first round of test reports. Thanks to everyone who ran 1.0.0.

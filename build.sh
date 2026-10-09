@@ -2,7 +2,8 @@
 # 1401 Probe: build everything in containers. Nothing is installed on this Mac.
 #   ./build.sh image     the offline Linux stick   -> out/usb/  and  out/1401-probe.img
 #   ./build.sh windows   the Windows installer     -> out/windows/1401-Probe-Setup.exe  (needs out/usb first)
-#   ./build.sh all       both
+#   ./build.sh nvpack    NVIDIA driver packs for the trace step -> out/nvpack/
+#   ./build.sh all       all three
 set -eu
 cd "$(dirname "$0")"
 what=${1:-all}
@@ -35,8 +36,12 @@ if [ -z "$NM_SEAL_KEY" ] && [ "${NM_ALLOW_NO_SEAL:-}" != 1 ]; then
 	echo "error: no seal key at $KF (NM_ALLOW_NO_SEAL=1 builds an unsealed image)"; exit 1
 fi
 export NM_SEAL_KEY
+# NVIDIA driver packs for the trace step (cached in out/nvpack; only a changed nvpack.sh or kernel rebuilds them)
+if [ "$what" = nvpack ] || [ "$what" = all ]; then
+	docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work "$ALPINE" sh probe/image/nvpack.sh
+fi
 if [ "$what" = image ] || [ "$what" = all ]; then
-	docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work -e NM_PRIVATE_RE -e NM_SEAL_KEY "$ALPINE" sh probe/image/build-inside.sh
+	docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work -e NM_PRIVATE_RE -e NM_SEAL_KEY -e NM_ALLOW_NO_NVPACK "$ALPINE" sh probe/image/build-inside.sh
 fi
 if [ "$what" = windows ] || [ "$what" = all ]; then
 	[ -f out/usb/boot/initramfs.zst ] || { echo "error: build the image first: ./build.sh image"; exit 1; }

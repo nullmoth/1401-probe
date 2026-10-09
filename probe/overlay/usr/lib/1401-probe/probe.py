@@ -40,6 +40,8 @@ import os
 import random
 import re
 import select
+import shutil
+import stat
 import shlex
 import struct
 import subprocess
@@ -49,7 +51,7 @@ import time
 import traceback
 import zipfile
 
-VERSION = "1.0.1"
+VERSION = "2.0.0"
 SCHEMA = "1401-probe/1"
 STICK_LABEL = "PROBE1401"
 MARKER = "1401-probe.marker"
@@ -266,6 +268,8 @@ def redact_tree():
     for root, _, files in os.walk(OUT):
         for fn in files:
             p = os.path.join(root, fn)
+            if fn.endswith(".mmio.xz"):
+                continue  # redacted as text before it was compressed (MmioTrace.save); editing xz bytes breaks it
             try:
                 with open(p, "rb") as f:
                     b = f.read()
@@ -1067,6 +1071,215 @@ def st_misc():
                    "hwmon": hw, "superio_log": sio[:20]}
 
 
+# NVIDIA architecture from NV_PMC_BOOT_0 bits 28:20 (architecture 28:24, implementation 23:20). What the build and
+# the driver need from it: which firmware, and which features the card has (RT cores, tensor cores, CUDA level).
+# GTX 16 parts (TU116/TU117) are Turing without RT or tensor cores.
+NV_ARCH = {0x05: ("Tesla", "1.0"), 0x08: ("Tesla", "1.1"), 0x09: ("Tesla", "1.2"), 0x0A: ("Tesla", "1.3"),
+           0x0C: ("Fermi", "2.0"), 0x0D: ("Fermi", "2.1"), 0x0E: ("Kepler", "3.0"), 0x0F: ("Kepler", "3.5"),
+           0x10: ("Kepler", "3.7"), 0x11: ("Maxwell", "5.0"), 0x12: ("Maxwell", "5.2"), 0x13: ("Pascal", "6.1"),
+           0x14: ("Volta", "7.0"), 0x16: ("Turing", "7.5"), 0x17: ("Ampere", "8.6"), 0x18: ("Hopper", "9.0"),
+           0x19: ("Ada", "8.9"), 0x1A: ("Blackwell", "10.0"), 0x1B: ("Blackwell", "12.0")}
+NV_NO_RT = {(0x16, 0x7), (0x16, 0x8)}
+# Known RGB/lighting, fingerprint, card-reader and Bluetooth-only USB vendors (ids only, never descriptors).
+USB_ROLE = {"0b05": "ASUS (Aura/ROG, often RGB)", "1462": "MSI (Mystic Light RGB)", "048d": "ITE (Gigabyte RGB Fusion)",
+            "1b1c": "Corsair (RGB)", "1038": "SteelSeries", "1532": "Razer", "06cb": "Synaptics (touchpad or fingerprint)",
+            "27c6": "Goodix (fingerprint)", "138a": "Validity (fingerprint)", "04f3": "ELAN (touchpad or fingerprint)",
+            "0bda": "Realtek (card reader, Bluetooth or webcam)", "8087": "Intel (Bluetooth)", "13d3": "IMC (Bluetooth or webcam)",
+            "0489": "Foxconn (Bluetooth)", "0cf3": "Qualcomm Atheros (Bluetooth)", "04ca": "Lite-On (Bluetooth or webcam)"}
+# ACPI method/object names that mark a switchable-graphics design. Present names are a hint, never proof of a MUX.
+MUX_NAMES = (b"NVOP", b"NBCI", b"NVHG", b"MXDS", b"MXMX", b"MXDM", b"GMUX", b"DGPU", b"HGDP", b"OPTS", b"ATPX")
+
+
+def codec_pins(txt):
+    """Wired pins of one HDA codec dump. One node per block, so a pin's config never borrows the next node's
+    (a single cross-node match put a front mic on the unused node before it)."""
+    pins = []
+    for block in re.split(r"\n(?=Node 0x)", txt):
+        hdr = re.match(r"Node (0x[0-9a-f]+) \[Pin Complex\]", block)
+        cfg = re.search(r"Pin Default 0x[0-9a-f]+: \[([\w/]+)\] (.+?) at (.+)", block)
+        if hdr and cfg and cfg.group(1) != "N/A":
+            pins.append({"node": hdr.group(1), "connection": cfg.group(1), "device": cfg.group(2).strip(),
+                         "location": cfg.group(3).strip()})
+    return pins
+
+
+def map_display():
+    """Every display connector with the GPU behind it, and which GPU the internal panel (eDP/LVDS/DSI) is wired to.
+    Run in st_map (firmware framebuffer only) and again after the GPU drivers bind, when connectors are real."""
+    out = []
+    for c in sorted(glob.glob("/sys/class/drm/card*-*")):
+        dev = os.path.realpath(os.path.dirname(c) + "/device")
+        edid = rd(c + "/edid", binary=True) or b""
+        out.append({"connector": os.path.basename(c).split("-", 1)[1], "card": os.path.basename(c).split("-")[0],
+                    "gpu": os.path.basename(dev), "status": rd(c + "/status"), "enabled": rd(c + "/enabled"),
+                    "edid_bytes": len(edid), "edid": edid_info(edid) if len(edid) >= 128 else None,
+                    "modes": (rd(c + "/modes") or "").split()[:40]})
+    internal = [c for c in out if re.match(r"(eDP|LVDS|DSI)", c["connector"] or "")]
+    panel = {"internal_connectors": internal,
+             "panel_gpu": sorted({c["gpu"] for c in internal if c["status"] == "connected"}),
+             "boot_vga": [d["bdf"] for d in REP.get("pci", []) if d.get("boot_vga") == "1"]}
+    return out, panel
+
+
+def st_map():
+    """Everything the build or the driver had to know about on studio and on users' machines, in one structured map:
+    display wiring and the panel's GPU, MUX hints, GPU features, PCIe links, slots, storage, sensors and fans,
+    lighting/USB roles, laptop parts, memory modules, CPU topology, IOMMU and the firmware memory map."""
+    m, errs = {}, {}
+
+    def part(name, fn):
+        try:
+            m[name] = fn()
+        except Exception as e:  # one unreadable part never costs the rest of the map
+            errs[name] = "%s: %s" % (type(e).__name__, e)
+
+    def mux():
+        hits = {}
+        for f in sorted(glob.glob("/sys/firmware/acpi/tables/*")) + sorted(glob.glob("/sys/firmware/acpi/tables/dynamic/*")):
+            blob = rd(f, binary=True) or b""
+            found = sorted({n.decode() for n in MUX_NAMES if n in blob})
+            if found:
+                hits[f.replace("/sys/firmware/acpi/tables/", "")] = found
+        return {"acpi_names": hits, "note": "names found in ACPI tables; a hint at switchable graphics, not proof of a MUX"}
+
+    def gpu_features():
+        out = []
+        for g in REP.get("gpus", []):
+            d = {"bdf": g.get("bdf"), "vendor": g.get("vendor"), "device": g.get("device"), "bars": g.get("bars"),
+                 "rebar": g.get("rebar")}
+            nv = g.get("nv") or {}
+            b0 = ival(nv.get("pmc_boot_0") or "")
+            if b0:
+                arch, impl = (b0 >> 24) & 0x1F, (b0 >> 20) & 0xF
+                name, cc = NV_ARCH.get(arch, ("unknown 0x%x" % arch, None))
+                d.update(architecture=name, chip_impl=hx(impl, 1), cuda_compute=cc,
+                         rt_cores=arch >= 0x16 and (arch, impl) not in NV_NO_RT,
+                         tensor_cores=arch >= 0x14 and (arch, impl) not in NV_NO_RT,
+                         gsp_firmware_needed=arch >= 0x16)
+            out.append(d)
+        return out
+
+    def slots():
+        txt = sh("map/dmidecode-slots.txt", ["dmidecode", "-t", "9"], 30)
+        return [{"designation": (re.search(r"Designation: (.+)", b) or [None, None])[1],
+                 "type": (re.search(r"Type: (.+)", b) or [None, None])[1],
+                 "usage": (re.search(r"Current Usage: (.+)", b) or [None, None])[1],
+                 "bus": (re.search(r"Bus Address: (.+)", b) or [None, None])[1]}
+                for b in txt.split("\n\n") if "System Slot Information" in b]
+
+    def memory():
+        txt = sh(None, ["dmidecode", "-t", "17"], 30)
+        txt = re.sub(r"(?m)^(\s*(Serial Number|Asset Tag|Part Number):).*$", r"\1 [removed]", txt)
+        save("map/dmidecode-memory.txt", txt)
+        keys = ("Size", "Type", "Speed", "Configured Memory Speed", "Form Factor", "Locator", "Manufacturer", "Rank")
+        return [{k: (re.search(r"\n\s*%s: (.+)" % re.escape(k), b) or [None, None])[1] for k in keys}
+                for b in txt.split("\n\n") if "Memory Device" in b]
+
+    def storage():
+        nvme = [{"name": os.path.basename(d), "model": rd(d + "/model"), "firmware": rd(d + "/firmware_rev"),
+                 "transport": rd(d + "/transport"), "pci": os.path.basename(os.path.realpath(d + "/device"))}
+                for d in sorted(glob.glob("/sys/class/nvme/nvme*"))]
+        ports = [{"port": os.path.basename(d), "link_speed": rd(d.replace("ata_port", "ata_link") + "/sata_spd"),
+                  "host": os.path.basename(os.path.dirname(os.path.dirname(os.path.realpath(d))))}
+                 for d in sorted(glob.glob("/sys/class/ata_port/ata*"))]
+        links = [{"link": os.path.basename(d), "sata_spd": rd(d + "/sata_spd"), "hw_sata_spd_limit": rd(d + "/hw_sata_spd_limit")}
+                 for d in sorted(glob.glob("/sys/class/ata_link/link*"))]
+        ctrl = [{"bdf": d["bdf"], "class": d.get("class"), "vendor": d.get("vendor"), "device": d.get("device"),
+                 "mode": {"0x010601": "AHCI", "0x010400": "RAID", "0x010802": "NVMe", "0x010700": "SAS"}.get(d.get("class"), d.get("class"))}
+                for d in REP.get("pci", []) if (d.get("class") or "").startswith("0x01")]
+        vmd = [d["bdf"] for d in REP.get("pci", []) if d.get("vendor") == "0x8086" and
+               (d.get("device") or "") in ("0x9a0b", "0x467f", "0xa77f", "0xad0b", "0x7d0b", "0x201d", "0x28c0")]
+        return {"nvme": nvme, "ata_ports": ports, "ata_links": links, "controllers": ctrl, "intel_vmd": vmd}
+
+    def sensors():
+        out = []
+        for d in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+            fans = {os.path.basename(f): rd(f) for f in sorted(glob.glob(d + "/fan*_input"))}
+            pwm = sorted(os.path.basename(f) for f in glob.glob(d + "/pwm[0-9]"))
+            temps = {os.path.basename(f): rd(f) for f in sorted(glob.glob(d + "/temp*_input"))}
+            out.append({"name": rd(d + "/name"), "fans_rpm": fans, "pwm_controls": pwm, "temps_mC": temps})
+        return out
+
+    def usb_roles():
+        out = []
+        for d in sorted(glob.glob("/sys/bus/usb/devices/*")):
+            v, p = rd(d + "/idVendor"), rd(d + "/idProduct")
+            if not v:
+                continue
+            classes = sorted({rd(i + "/bInterfaceClass") for i in glob.glob(d + "/*:*") if rd(i + "/bInterfaceClass")})
+            role = []
+            if "e0" in classes: role.append("Bluetooth")
+            if "0e" in classes: role.append("camera")
+            if "01" in classes: role.append("audio")
+            if "03" in classes: role.append("HID")
+            if "08" in classes: role.append("storage or card reader")
+            out.append({"port": os.path.basename(d), "id": "%s:%s" % (v, p), "classes": classes, "role": role,
+                        "vendor_hint": USB_ROLE.get(v), "speed": rd(d + "/speed")})
+        return out
+
+    def network():
+        pci = REP.get("pci", [])
+        return {"ethernet": [d for d in pci if (d.get("class") or "").startswith("0x0200")],
+                "wifi": [d for d in pci if (d.get("class") or "").startswith("0x0280")],
+                "note": "this stick loads no network drivers; chips are identified by PCI/USB ids only"}
+
+    def laptop():
+        return {"lid": os.path.exists("/proc/acpi/button/lid") or bool(glob.glob("/sys/bus/acpi/devices/PNP0C0D*")),
+                "leds": [{"name": os.path.basename(d), "max": rd(d + "/max_brightness")} for d in sorted(glob.glob("/sys/class/leds/*"))],
+                "touchpad_candidates": [i for i in (REP.get("misc") or {}).get("i2c", [])
+                                        if re.search(r"(ELAN|SYNA|MSFT0001|PNP0C50|ACPI0C50|ALPS|FTCS|GXTP|DELL|ASUE|HTIX)", "%s %s" % (i.get("hid"), i.get("dev")))],
+                "ps2": [l for l in (rd("/proc/bus/input/devices") or "").split("\n\n") if "serio" in l.lower()][:6]}
+
+    def cpu_topology():
+        cpus = []
+        for d in sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*"), key=lambda x: int(re.sub(r"\D", "", os.path.basename(x)))):
+            t = d + "/topology/"
+            cpus.append({"cpu": os.path.basename(d), "core": rd(t + "core_id"), "package": rd(t + "physical_package_id"),
+                         "die": rd(t + "die_id"), "cluster": rd(t + "cluster_id")})
+        flags = (re.search(r"^flags\s*: (.+)$", rd("/proc/cpuinfo") or "", re.M) or [None, ""])[1].split()
+        return {"cpus": cpus, "p_cores": rd("/sys/devices/cpu_core/cpus"), "e_cores": rd("/sys/devices/cpu_atom/cpus"),
+                "features": sorted(f for f in flags if f in ("avx", "avx2", "avx512f", "avx_vnni", "sse4_2", "fma", "bmi2",
+                                                            "sha_ni", "vmx", "svm", "hypervisor", "x2apic", "pcid", "invpcid"))}
+
+    def firmware_memory():
+        rt = [{"entry": os.path.basename(d), **{k: rd(d + "/" + k) for k in ("type", "phys_addr", "virt_addr", "num_pages", "attribute")}}
+              for d in sorted(glob.glob("/sys/firmware/efi/runtime-map/*"))]
+        mm = [{k: rd(d + "/" + k) for k in ("start", "end", "type")} for d in sorted(glob.glob("/sys/firmware/memmap/*"))]
+        save("map/iomem.txt", rd("/proc/iomem") or "")
+        return {"efi_runtime_map": rt, "memmap": mm,
+                "note": "runtime map + memmap + iomem decide DevirtualiseMmio, MmioWhitelist and memory fences before the first boot"}
+
+    def audio_endpoints():
+        """From each codec's pin configs: the speakers, mics, headphone/line jacks and HDMI/DP audio it wires up.
+        This is what picks AppleALC's layout-id and says whether built-in speakers and mic can work."""
+        out = []
+        for f in sorted(glob.glob("/proc/asound/card*/codec#*")):
+            txt = rd(f) or ""
+            pins = codec_pins(txt)
+            codec = (re.search(r"^Codec: (.+)$", txt, re.M) or [None, None])[1]
+            out.append({"codec": codec, "file": f.split("/")[3] + "/" + os.path.basename(f), "pins": pins,
+                        "speakers": sum(p["device"] == "Speaker" for p in pins),
+                        "mics": sum("Mic" in p["device"] for p in pins),
+                        "headphones": sum(p["device"] in ("HP Out", "Headphone") for p in pins),
+                        "digital_out": sum(p["device"] in ("Digital Out", "SPDIF Out") for p in pins)})
+        return out
+
+    def iommu():
+        return {"units": [os.path.basename(d) for d in sorted(glob.glob("/sys/class/iommu/*"))],
+                "dmar_table": os.path.exists("/sys/firmware/acpi/tables/DMAR"), "ivrs_table": os.path.exists("/sys/firmware/acpi/tables/IVRS")}
+
+    part("display", lambda: map_display())
+    m["display_connectors"], m["panel"] = (m.pop("display", None) or ([], {}))
+    for name, fn in (("mux_hints", mux), ("gpu_features", gpu_features),
+                     ("slots", slots), ("memory_modules", memory), ("storage", storage), ("sensors_fans", sensors),
+                     ("usb_roles", usb_roles), ("network", network), ("laptop", laptop), ("cpu_topology", cpu_topology),
+                     ("firmware_memory", firmware_memory), ("audio_endpoints", audio_endpoints), ("iommu", iommu)):
+        part(name, fn)
+    m["errors"] = errs
+    REP["map"] = m
+    save("map/map.json", m)
+
+
 def rom_images(rom):
     """Walk the PCI expansion-ROM image chain. has_gop = a UEFI x64 driver is in the ROM, which is what
     draws the OpenCore picker on a discrete card."""
@@ -1162,6 +1375,25 @@ def memory_decode(bdf):
         os.close(fd)
 
 
+def st_report():
+    """The build engine reads a Hardware-Sniffer Report.json. Its own Linux collector (bundled, BSD-3) writes one
+    here, so the stick's capture feeds the same engine and every rule already in it, with no converter to drift."""
+    import io  # noqa: PLC0415
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hsniffer")
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    from Scripts.platforms.linux import LinuxHardwareInfo  # noqa: PLC0415
+    hw = LinuxHardwareInfo(rich_format=False)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):  # its progress prints would land on the probe's screen
+        hw.hardware_collector()
+    save("hsniffer/collector.log", buf.getvalue())
+    if not hw.result:
+        raise RuntimeError("collector returned no sections")
+    save("hsniffer/Report.json", hw.result)
+    REP["report_sections"] = sorted(hw.result)
+
+
 def st_gpu_raw():
     gpus = []
     for d in REP.get("pci", []):
@@ -1238,6 +1470,13 @@ def st_gpu_drivers():
                 if go:
                     sh("kernel/modprobe-%s.txt" % second, ["modprobe", second], 150)
     time.sleep(6)  # connectors are probed asynchronously after the driver binds
+    try:  # the panel->GPU wiring is only real once the drivers have probed their connectors
+        mp = REP.setdefault("map", {})
+        mp["display_connectors"], mp["panel"] = map_display()
+        mp["display_after_drivers"] = True
+        save("map/map.json", mp)
+    except Exception as e:
+        REP.setdefault("map", {}).setdefault("errors", {})["display_after_drivers"] = "%s: %s" % (type(e).__name__, e)
     sh("kernel/dmesg-2-after-gpu-drivers.txt", ["dmesg"], 20)
     conns = []
     for c in sorted(glob.glob("/sys/class/drm/card*-*")):
@@ -1372,6 +1611,373 @@ def summary():
     return "\n".join(L) + "\n"
 
 
+TRACE = "/sys/kernel/tracing"
+# all driver traces together, compressed. The site takes 64 MB per file (moth_upload max_body); the rest of the
+# report needs room too. Chosen by us, not measured: a first real run sets it properly.
+TRACE_BUDGET = 40 << 20
+TRACE_RAW_CAP = 384 << 20  # raw text per trace, held in RAM while the trace runs
+
+
+def _tw(path, text):
+    with open(path, "w") as f:
+        f.write(text)
+
+
+class MmioTrace:
+    """mmiotrace: the kernel records every read and write a driver makes to a device's registers, from the moment
+    it maps them. Started BEFORE the driver binds, so the whole bring-up is in it: where software meets hardware.
+    While it runs the kernel takes every CPU but one offline, so the raw text only goes to RAM here and is
+    compressed afterwards (compressing on the one CPU would make the kernel drop events)."""
+
+    def __init__(self, name, cap=TRACE_RAW_CAP):
+        self.name, self.cap, self.size, self.idle = name, cap, 0, 0.0
+        self.raw = os.path.join(WORK, ".trace-%s.raw" % name)  # outside OUT: never zipped raw
+
+    def __enter__(self):
+        if not os.path.exists(TRACE + "/current_tracer"):
+            os.makedirs(TRACE, exist_ok=True)
+            sh(None, ["mount", "-t", "tracefs", "nodev", TRACE], 10)
+        if "mmiotrace" not in (rd(TRACE + "/available_tracers") or ""):
+            raise RuntimeError("this kernel has no mmiotrace tracer")
+        _tw(TRACE + "/current_tracer", "nop")
+        _tw(TRACE + "/buffer_size_kb", "65536")
+        _tw(TRACE + "/current_tracer", "mmiotrace")
+        self.stop = threading.Event()
+        self.fd = os.open(TRACE + "/trace_pipe", os.O_RDONLY | os.O_NONBLOCK)
+        self.out = open(self.raw, "wb")
+        self.th = threading.Thread(target=self._pump, daemon=True)
+        self.th.start()
+        return self
+
+    def mark(self, text):
+        try:
+            _tw(TRACE + "/trace_marker", text)
+        except OSError:
+            pass
+
+    def _pump(self):
+        while not (self.stop.is_set() and self.idle >= 0.6):
+            r, _, _ = select.select([self.fd], [], [], 0.2)
+            try:
+                chunk = os.read(self.fd, 1 << 20) if r else b""
+            except BlockingIOError:
+                chunk = b""
+            if chunk:
+                if self.size < self.cap:
+                    self.out.write(chunk[:self.cap - self.size])
+                self.size += len(chunk)
+                self.idle = 0.0
+            else:
+                self.idle += 0.2
+
+    def __exit__(self, *exc):
+        # drain first: switching the tracer to nop throws away whatever the pipe still holds
+        t0 = time.monotonic()
+        while self.idle < 1.0 and time.monotonic() - t0 < 20:
+            time.sleep(0.2)
+        self.overrun = (re.search(r"overrun: (\d+)", rd(TRACE + "/per_cpu/cpu0/stats") or "") or [None, None])[1]
+        # the pipe closes BEFORE the tracer changes: an open trace_pipe holds the tracer, and switching it then
+        # fails with EBUSY (QEMU test, 10-08), which lost the trace AND left mmiotrace on with one CPU online
+        self.stop.set()
+        self.th.join(30)
+        os.close(self.fd)
+        self.out.close()
+        _tw(TRACE + "/current_tracer", "nop")
+        return False
+
+    def save(self, budget):
+        """Redact the raw text with the same values as the rest of the report, then compress up to `budget`
+        bytes (soft, see below). Keeps the HEAD when it must cut: the bring-up is the part nothing else can give us."""
+        import lzma  # noqa: PLC0415
+        pats = [re.compile(re.escape(v.encode("utf-8", "replace")), re.I) for v in SECRETS.values]
+        dst = os.path.join(OUT, "trace", self.name + ".mmio.xz")
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        # a 1 MiB dictionary, not preset 6's 8 MiB: xz holds up to a dictionary of output back until the flush,
+        # and that held-back output is what the budget cannot see (measured: 8.4 MB out for a 2 MB budget at 8 MiB)
+        comp = lzma.LZMACompressor(filters=[{"id": lzma.FILTER_LZMA2, "preset": 6, "dict_size": 1 << 20}])
+        written, cut, lines = 0, False, 0
+        with open(self.raw, "rb") as f, open(dst, "wb") as g:
+            while True:
+                chunk = f.read(4 << 20)
+                if not chunk:
+                    break
+                more = f.readline()  # whole lines only, so a value is never split across two redaction passes
+                chunk += more
+                for rx in pats:
+                    chunk = rx.sub(b"[REDACTED]", chunk)
+                lines += chunk.count(b"\n")
+                z = comp.compress(chunk)
+                g.write(z)  # every compressed byte is written: dropping one mid-stream corrupts the whole file
+                written += len(z)
+                if written >= budget:  # soft: over by at most one chunk plus the dictionary held back for the flush
+                    cut = True
+                    break
+            z = comp.flush()
+            g.write(z)
+            written += len(z)
+        os.unlink(self.raw)
+        return {"file": "trace/%s.mmio.xz" % self.name, "raw_bytes": self.size, "kept_raw_cap": self.size > self.cap,
+                "lines": lines, "compressed_bytes": written, "cut_for_budget": cut, "kernel_overrun": self.overrun}
+
+
+TRACE_LEFT = [TRACE_BUDGET]  # shared by every trace in one run (radios, GPUs, audio)
+
+
+def traced_run(name, fn):
+    """Run fn under mmiotrace, as its own freeze-remembered step, and save the trace inside the shared budget."""
+    tr = REP.setdefault("trace", {"runs": [], "errors": {}})
+    with step("trace:" + name) as go:
+        if not go:
+            tr["runs"].append({"name": name, "skipped": "it froze a previous run"})
+            return
+        try:
+            with MmioTrace(name) as t:
+                t.mark("1401 begin " + name)
+                fn()
+                t.mark("1401 end " + name)
+            r = t.save(TRACE_LEFT[0])
+            TRACE_LEFT[0] -= r["compressed_bytes"]
+            r["name"] = name
+            tr["runs"].append(r)
+        except Exception as e:  # noqa: BLE001 - recorded, the next device still gets its trace
+            tr["errors"][name] = "%s: %s" % (type(e).__name__, e)
+    checkpoint()
+
+
+def ask_radios():
+    """Asked at the start, while the person is at the screen. Default NO: the stick's promise is that it has no
+    network drivers, so loading any needs a yes, and the person is told exactly what happens."""
+    if "p1401.radios=yes" in CMDLINE:  # the QEMU test only: proves the opt-in path ends offline
+        return "test"
+    if MODE == "test":
+        return "test mode"
+    if not STICK or not glob.glob(os.path.join(MNT, "drivers", "radios-*.tar.xz")):
+        return "no radio pack on this stick"
+    UI.say("")
+    UI.say("  Optional: Wi-Fi, Bluetooth and Ethernet.")
+    UI.say("  This stick has no network drivers, so it cannot go online. To map those chips it can load their")
+    UI.say("  drivers for about a minute near the end and watch them start. Nothing is configured or sent: there is")
+    UI.say("  no network software on the stick, each radio is switched off the moment it starts, and the drivers")
+    UI.say("  are removed again before the report is finished.")
+    k = UI.countdown(30, "Press Y to include them (any other key, or nothing, skips)")
+    return "yes" if k in ("y", "Y") else ("no answer" if k is None else "no")
+
+
+def unpack_pack(fn, into):
+    import tarfile  # noqa: PLC0415
+    shutil.rmtree(into, ignore_errors=True)
+    with tarfile.open(fn) as t:
+        t.extractall(into, filter="data")
+    for line in (rd(os.path.join(into, "SHA256SUMS")) or "").splitlines():
+        want, rel = line.split(None, 1)
+        if rel.strip() in ("./SHA256SUMS", "SHA256SUMS"):
+            continue  # packs built before 2.0.0 shipped listed the sums file itself (hashed while still empty)
+        with open(os.path.join(into, rel.strip()), "rb") as f:
+            if hashlib.sha256(f.read()).hexdigest() != want:
+                raise RuntimeError("pack file %s does not match its sum" % rel)
+
+
+def learn_macs():
+    """A NIC's MAC is an identifier. It reaches the report as text (dmesg, sysfs) and, in a register trace, as the
+    32-bit value the driver reads from the address register (low four bytes, little-endian, printed 0x%x by
+    mmiotrace). Both forms become redaction values before the trace is saved. The last two bytes alone (16 bits)
+    are left: they identify nothing by themselves."""
+    for a in glob.glob("/sys/class/net/*/address") + glob.glob("/sys/class/bluetooth/*/address"):
+        mac = (rd(a) or "").strip().lower()
+        b = [int(x, 16) for x in mac.split(":")] if re.fullmatch(r"([0-9a-f]{2}:){5}[0-9a-f]{2}", mac) else None
+        if not b or mac == "00:00:00:00:00:00":
+            continue
+        SECRETS.add(mac, "mac")
+        SECRETS.add(mac.replace(":", ""), "mac")
+        SECRETS.add("0x%x" % (b[0] | b[1] << 8 | b[2] << 16 | b[3] << 24), "mac")
+
+
+def radios_off():
+    """Every radio soft-blocked and every interface but lo down. Called after each driver starts."""
+    for r in glob.glob("/sys/class/rfkill/rfkill*/soft"):
+        try:
+            _tw(r, "1")
+        except OSError:
+            pass
+    return net_state()
+
+
+def st_radios():
+    """OPT-IN (ask_radios). Loads only the Wi-Fi/Bluetooth/Ethernet drivers this machine's own devices ask for,
+    from the stick's radio pack, traces each PCI one starting up, switches it off at once, and unloads them all."""
+    rr = REP.setdefault("radios", {})
+    rel = os.uname().release
+    pk = os.path.join(MNT, "drivers", "radios-%s.tar.xz" % rel)
+    if not os.path.exists(pk):
+        raise RuntimeError("no radio pack for kernel %s on the stick" % rel)
+    before = {l.split()[0] for l in (rd("/proc/modules") or "").splitlines() if l.strip()}
+    d = "/run/radios"
+    unpack_pack(pk, d)
+    shutil.copytree(os.path.join(d, "modules"), "/lib/modules/%s" % rel, dirs_exist_ok=True)
+    if os.path.isdir(os.path.join(d, "firmware")):
+        shutil.copytree(os.path.join(d, "firmware"), "/lib/firmware", dirs_exist_ok=True)
+    shutil.rmtree(d, ignore_errors=True)
+    sh("radios/depmod.txt", ["depmod", "-a"], 60)
+    devs = []
+    for p in sorted(glob.glob("/sys/bus/pci/devices/*")):
+        cls = (rd(p + "/class") or "")[:6]
+        if cls.startswith("0x02") or cls == "0x0d11":  # network controllers, PCI Bluetooth
+            devs.append(("pci", os.path.basename(p), (rd(p + "/modalias") or "").strip()))
+    for p in sorted(glob.glob("/sys/bus/usb/devices/*:*")):
+        if (rd(p + "/bInterfaceClass") or "").strip() in ("e0", "02", "0a") or "/net/" in str(glob.glob(p + "/net")):
+            devs.append(("usb", os.path.basename(p), (rd(p + "/modalias") or "").strip()))
+    rr["devices"] = [{"bus": b, "id": i} for b, i, _ in devs]
+    for bus, ident, alias in devs:
+        if not alias:
+            continue
+        # -i: the image's modprobe.d forbids cfg80211/mac80211 outright; this yes is the one place that may load them
+        load = lambda alias=alias, ident=ident: (sh("radios/modprobe-%s.txt" % ident.replace(":", "_"),
+                                                    ["modprobe", "-i", "-b", alias], 90), time.sleep(6), learn_macs())
+        if bus == "pci":
+            UI.say("    tracing the network/radio driver for %s ..." % ident)
+            traced_run("radio-" + ident.replace(":", "_"), load)
+        else:
+            load()  # USB: no registers to map, the firmware upload shows in the kernel log
+        rr.setdefault("off_after", {})[ident] = radios_off()
+    rr["interfaces"] = {i: {"driver": rdlink("/sys/class/net/%s/device/driver" % i),
+                            "device": rdlink("/sys/class/net/%s/device" % i),
+                            "wireless": os.path.isdir("/sys/class/net/%s/wireless" % i) or os.path.isdir("/sys/class/net/%s/phy80211" % i)}
+                        for i in sorted(os.listdir("/sys/class/net")) if i != "lo"}
+    rr["bluetooth"] = {h: rdlink("/sys/class/bluetooth/%s/device/driver" % h) for h in sorted(os.listdir("/sys/class/bluetooth"))} \
+        if os.path.isdir("/sys/class/bluetooth") else {}
+    sh("radios/dmesg.txt", ["dmesg"], 30)
+    loaded = [l.split()[0] for l in (rd("/proc/modules") or "").splitlines() if l.strip() and l.split()[0] not in before]
+    rr["loaded"] = loaded
+    for _ in range(3):  # dependents first; a few passes untangle the order without a graph
+        for m in loaded:
+            subprocess.run(["rmmod", m], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    rr["left_loaded"] = [m for m in loaded if os.path.isdir("/sys/module/" + m) and (rd("/sys/module/%s/initstate" % m) or "").strip() == "live"]
+    rr["after_unload"] = radios_off()
+    save("radios/radios.json", rr)
+    if rr["left_loaded"] or not rr["after_unload"]["offline"]:
+        raise RuntimeError("radio drivers still loaded %s / offline=%s (all forced down)" % (rr["left_loaded"], rr["after_unload"]["offline"]))
+
+
+def nv_pack_for(arch, packs_dir):
+    """The NVIDIA driver pack on the stick that supports this architecture on this kernel, or None (nouveau only)."""
+    import tarfile  # noqa: PLC0415
+    rel = os.uname().release
+    for fn in sorted(glob.glob(os.path.join(packs_dir, "nvidia-*.tar.xz")), reverse=True):
+        try:
+            with tarfile.open(fn) as t:
+                meta = json.load(t.extractfile("./pack.json"))
+        except (OSError, KeyError, ValueError, tarfile.TarError):
+            continue
+        if meta.get("kernel") == rel and ("%x" % arch) in meta.get("archs", "").split(","):
+            return fn, meta
+    return None
+
+
+def nv_install_pack(fn, meta):
+    """Unpack into RAM, check every file against the pack's own sums, then put modules and firmware where
+    modprobe and the kernel's firmware loader look."""
+    d = "/run/nvpack"
+    unpack_pack(fn, d)
+    rel = os.uname().release
+    md = "/lib/modules/%s/extra/nvidia" % rel
+    shutil.rmtree(md, ignore_errors=True)
+    shutil.copytree(os.path.join(d, "modules"), md)
+    fw = os.path.join(d, "firmware")
+    if os.path.isdir(fw):
+        shutil.copytree(fw, "/lib/firmware", dirs_exist_ok=True)
+    shutil.rmtree(d, ignore_errors=True)
+    sh("trace/depmod.txt", ["depmod", "-a"], 60)
+
+
+def nv_open_all():
+    """RM only brings a GPU up (GSP boot, memory, display) when its device node is opened; nothing on the stick
+    would open it, so the trace does. Nodes made by hand: there is no udev or nvidia-modprobe here."""
+    fds = []
+    try:
+        os.mknod("/dev/nvidiactl", 0o600 | stat.S_IFCHR, os.makedev(195, 255))
+    except FileExistsError:
+        pass
+    for info in glob.glob("/proc/driver/nvidia/gpus/*/information"):
+        m = re.search(r"Device Minor:\s+(\d+)", rd(info) or "")
+        if not m:
+            continue
+        node = "/dev/nvidia%s" % m.group(1)
+        try:
+            os.mknod(node, 0o600 | stat.S_IFCHR, os.makedev(195, int(m.group(1))))
+        except FileExistsError:
+            pass
+        try:
+            fds.append(os.open(node, os.O_RDWR))
+        except OSError as e:
+            REP.setdefault("trace", {}).setdefault("errors", {})[node] = str(e)
+    return fds
+
+
+def pci_rebind(bdf, drv):
+    if rdlink("/sys/bus/pci/devices/%s/driver" % bdf):
+        _tw("/sys/bus/pci/devices/%s/driver/unbind" % bdf, bdf)
+    _tw("/sys/bus/pci/drivers/%s/bind" % drv, bdf)
+
+
+def st_trace():
+    """Last: watch each driver bring its device up. Every GPU and HD-audio function gets its in-kernel driver
+    re-bound under mmiotrace; an NVIDIA card also gets NVIDIA's own driver for its generation from the stick's
+    drivers/ packs (open 610 for Turing+, closed 580 for Maxwell-Volta, closed 470 for Kepler; Fermi and Tesla
+    stay on nouveau). Storage and USB are never touched: the stick itself hangs off them."""
+    tr = REP.setdefault("trace", {"runs": [], "errors": {}})
+    left = TRACE_LEFT
+    run = traced_run
+
+    devs = []
+    for d in sorted(glob.glob("/sys/bus/pci/devices/*")):
+        cls = (rd(d + "/class") or "")[:6]
+        drv = rdlink(d + "/driver")
+        if drv and (cls.startswith("0x03") or cls == "0x0403"):
+            devs.append((os.path.basename(d), drv, cls))
+    for bdf, drv, cls in devs:
+        UI.say("    tracing %s on %s ..." % (drv, bdf))
+        run("%s-%s" % (drv, bdf.replace(":", "_")), lambda bdf=bdf, drv=drv: (pci_rebind(bdf, drv), time.sleep(8)))
+
+    nv = [g for g in REP.get("gpus", []) if g.get("vendor") == "0x10de"]
+    packs = os.path.join(MNT, "drivers")
+    chosen = {}
+    for g in nv:
+        b0 = ival((g.get("nv") or {}).get("pmc_boot_0") or "")
+        hit = nv_pack_for((b0 >> 24) & 0x1F, packs) if b0 else None
+        g_name = NV_ARCH.get((b0 >> 24) & 0x1F, ("unknown",))[0] if b0 else "unknown"
+        tr.setdefault("nvidia_driver", {})[g["bdf"]] = hit[1]["name"] if hit else "none for %s: nouveau only" % g_name
+        if hit:
+            chosen[hit[0]] = hit[1]
+    for fn, meta in chosen.items():  # in practice one: two NVIDIA generations in one PC is rare
+        UI.say("    NVIDIA driver %s %s (the screen may go black) ..." % (meta["kind"], meta["version"]))
+        try:
+            nv_install_pack(fn, meta)
+        except Exception as e:  # noqa: BLE001
+            tr["errors"][meta["name"]] = "install: %s: %s" % (type(e).__name__, e)
+            continue
+        sh("trace/rmmod-nouveau.txt", ["modprobe", "-r", "nouveau"], 60)
+        fds = []
+
+        def bring_up():
+            sh("trace/%s-load.txt" % meta["name"], ["modprobe", "nvidia"], 120)
+            fds.extend(nv_open_all())
+            sh("trace/%s-modeset.txt" % meta["name"], ["modprobe", "nvidia-drm", "modeset=1", "fbdev=0"], 120)
+            time.sleep(10)  # connectors are probed after the bind, and the heads are assigned then
+        run(meta["name"], bring_up)
+        for info in glob.glob("/proc/driver/nvidia/gpus/*/information"):
+            save("trace/%s/%s.txt" % (meta["name"], info.split("/")[-2].replace(":", "_")), rd(info) or "")
+        try:
+            tr.setdefault("nvidia_display", {})[meta["name"]] = map_display()[0]
+        except Exception as e:  # noqa: BLE001
+            tr["errors"][meta["name"] + ":display"] = str(e)
+        for f in fds:
+            os.close(f)
+        sh("trace/%s-unload.txt" % meta["name"], ["modprobe", "-r", "nvidia-drm", "nvidia-modeset", "nvidia"], 120)
+        sh("trace/modprobe-nouveau-again.txt", ["modprobe", "nouveau"], 150)  # the console comes back for the last screen
+    tr["budget_left"] = TRACE_LEFT[0]
+    save("trace/trace.json", tr)
+
+
 def run_stage(i, n, title, key, fn, timeout):
     UI.say(" [%2d/%d] %-44s" % (i, n, title), end="")
     if "stage:" + key in SKIP:
@@ -1460,13 +2066,18 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     REP["meta"]["name"] = NAME
     REP["meta"]["stick"] = bool(STICK)
+    radios = ask_radios() if MODE in ("full", "test") else "not in this mode"
+    REP.setdefault("radios", {})["consent"] = radios
     stages = [("Firmware and boot mode", "meta", st_meta, 20), ("Computer and motherboard", "dmi", st_dmi, 40),
               ("Processor (CPUID, MSRs)", "cpu", st_cpu, 180), ("PCI devices", "pci", st_pci, 180),
               ("USB controllers and ports", "usb", st_usb, 90), ("ACPI tables", "acpi", st_acpi, 90),
               ("UEFI firmware", "efi", st_efi, 60), ("Drives (identity only)", "storage", st_storage, 60),
               ("Audio, input, sensors", "misc", st_misc, 150), ("Graphics cards (VBIOS)", "gpu_raw", st_gpu_raw, 120),
+              ("Full system map", "map", st_map, 120), ("Build-engine report", "report", st_report, 120),
               ("Kernel log", "dmesg", st_dmesg, 30)]
-    total = len(stages) + (1 if MODE == "full" else 0)
+    if radios in ("yes", "test"):
+        stages.append(("Wi-Fi, Bluetooth, Ethernet (you said yes)", "radios", st_radios, 300))
+    total = len(stages) + (2 if MODE == "full" else 0)
     for i, (title, key, fn, t) in enumerate(stages, 1):
         run_stage(i, total, title, key, fn, t)
     s = summary()
@@ -1479,13 +2090,15 @@ def main():
     known = {g.get("vendor") for g in REP.get("gpus", [])} & {"0x10de", "0x1002", "0x8086"}
     if MODE == "full" and known:
         UI.say("  Your report is saved. Last step: a graphics-driver test.")
-        UI.say("  The screen may flicker or go black for up to 3 minutes. The computer turns itself off when done.")
-        UI.say("  If nothing happens for 5 minutes, hold the power button. Your report is already saved.")
+        UI.say("  Then each driver is watched while it starts its device (NVIDIA cards get NVIDIA's own driver).")
+        UI.say("  The screen may flicker or go black for up to 10 minutes. The computer turns itself off when done.")
+        UI.say("  If nothing happens for 15 minutes, hold the power button. Your report is already saved.")
         UI.say("  Then start the stick again: it skips the step that froze.")
         # No skip key: the graphics-driver stage is the data NullMoth needs most. A freeze here is
         #   remembered on the stick, so the next run skips only the driver that froze (step "driver:<name>").
         UI.countdown(20, "Starting in (any key starts now)")
-        run_stage(total, total, "Graphics drivers (connectors, firmware)", "gpu_drivers", st_gpu_drivers, 420)
+        run_stage(total - 1, total, "Graphics drivers (connectors, firmware)", "gpu_drivers", st_gpu_drivers, 420)
+        run_stage(total, total, "Driver trace (what each driver does to the hardware)", "trace", st_trace, 900)
     elif MODE == "full":
         REP["stages"]["gpu_drivers"] = {"status": "skipped", "seconds": 0, "error": "no NVIDIA/AMD/Intel display device"}
     elif MODE == "safe":
@@ -1626,8 +2239,47 @@ def selftest():
     a = label_argv(["/dev/sdb", "/dev/sdb1"])
     check("   ... and with candidates blkid is limited to exactly them", a is not None and a[-2:] == ["/dev/sdb", "/dev/sdb1"], str(a))
 
+    # full system map: GPU features decode from BOOT_0, GTX 16 has no RT/tensor, memory serials never survive,
+    # and on a machine where nothing is readable the stage still finishes and says what it could not read
+    global sh, NAME, SEAL_KEY, MNT, STICK, MACHINE
+    real_sh, saved_gpus = sh, REP.get("gpus")
+    fake17 = ("Handle 0x0040, DMI type 17\nMemory Device\n\tSize: 16 GB\n\tType: DDR5\n\tSpeed: 5600 MT/s\n"
+              "\tManufacturer: Kingston\n\tSerial Number: 9ABCDEF1\n\tPart Number: KF556C40-16\n\tLocator: DIMM_A1\n")
+    sh = lambda rel, argv, timeout=60: (save(rel, fake17) or fake17) if rel else fake17 if argv[:3] == ["dmidecode", "-t", "17"] else ""
+    REP["gpus"] = [{"bdf": "0000:01:00.0", "vendor": "0x10de", "nv": {"pmc_boot_0": "0x1b2000a1"}},
+                   {"bdf": "0000:02:00.0", "vendor": "0x10de", "nv": {"pmc_boot_0": "0x167000a1"}}]
+    try:
+        st_map()
+    finally:
+        sh = real_sh
+    mp = REP.get("map", {})
+    gf = {g["bdf"]: g for g in mp.get("gpu_features", [])}
+    bw, tu = gf.get("0000:01:00.0", {}), gf.get("0000:02:00.0", {})
+    check("a Blackwell BOOT_0 decodes to Blackwell, CUDA 12.0, RT and tensor cores, GSP firmware needed",
+        bw.get("architecture") == "Blackwell" and bw.get("cuda_compute") == "12.0" and bw.get("rt_cores") and bw.get("tensor_cores")
+        and bw.get("gsp_firmware_needed"), str(bw))
+    check("   ... and a GTX 16 (TU117) is Turing with NO RT and NO tensor cores", tu.get("architecture") == "Turing"
+        and tu.get("rt_cores") is False and tu.get("tensor_cores") is False, str(tu))
+    mtxt = open(os.path.join(OUT, "map/dmidecode-memory.txt")).read()
+    mods = mp.get("memory_modules") or [{}]
+    check("a memory module's serial and part number never reach the report; its size, type and speed do",
+        "9ABCDEF1" not in mtxt and "KF556C40" not in mtxt and mods[0].get("Size") == "16 GB" and mods[0].get("Type") == "DDR5",
+        str(mods[0]))
+    check("every map section is present, and what could not be read is named in errors, not raised",
+        all(k in mp for k in ("display_connectors", "panel", "mux_hints", "gpu_features", "slots", "memory_modules", "storage",
+                               "sensors_fans", "usb_roles", "network", "laptop", "cpu_topology", "firmware_memory", "audio_endpoints", "iommu", "errors")),
+        str(sorted(mp)))
+    check("an Optimus method name in an ACPI table is recognised as a MUX hint", b"NVOP" in MUX_NAMES and b"ATPX" in MUX_NAMES)
+    cp = codec_pins("Codec: Realtek ALC897\nNode 0x14 [Pin Complex] w\n  Pin Default 0x01014010: [Jack] Line Out at Ext Rear\n"
+                    "Node 0x17 [Pin Complex] w\n  Pin Default 0x90170110: [Fixed] Speaker at Int N/A\n"
+                    "Node 0x18 [Pin Complex] w\n  Pin Default 0x411111f0: [N/A] Speaker at Ext Rear\n"
+                    "Node 0x19 [Pin Complex] w\n  Pin Default 0x02a19030: [Jack] Mic at Ext Front\nNode 0x1b [Audio Mixer] w\n")
+    check("codec pins: built-in speaker, front mic and rear line out are found on their own nodes; an unused pin is skipped",
+        [(p["node"], p["device"], p["location"]) for p in cp] == [("0x14", "Line Out", "Ext Rear"), ("0x17", "Speaker", "Int N/A"),
+                                                                  ("0x19", "Mic", "Ext Front")], str(cp))
+    REP["gpus"] = saved_gpus
+
     # seal: a report sealed here verifies with the key; one changed byte or one added file does not
-    global NAME, SEAL_KEY, MNT, STICK, MACHINE
     NAME = "SELFTEST"
     kf = os.path.join(tempfile.mkdtemp(), "seal.key")
     key = bytes(range(32))
@@ -1688,6 +2340,81 @@ def selftest():
         debugfs_dirs(["/d/dri/0", "/d/dri/0000:01:00.0", "/d/dri/128"]) == ["/d/dri/0000:01:00.0"])
     check("   ... and by number (below 128) on a kernel without address directories",
         debugfs_dirs(["/d/dri/0", "/d/dri/1", "/d/dri/128", "/d/dri/129"]) == ["/d/dri/0", "/d/dri/1"])
+
+    # driver trace: the right NVIDIA driver per generation, and a trace that is redacted, whole and inside its budget
+    import io
+    import lzma
+    import tarfile
+    pd = tempfile.mkdtemp()
+
+    def mkpack(name, archs, kernel=os.uname().release):
+        with tarfile.open(os.path.join(pd, name + ".tar.xz"), "w:xz") as t:
+            b = json.dumps({"name": name, "kernel": kernel, "archs": archs, "kind": "x", "version": "0"}).encode()
+            ti = tarfile.TarInfo("./pack.json")
+            ti.size = len(b)
+            t.addfile(ti, io.BytesIO(b))
+    mkpack("nvidia-open-610.57.04", "16,17,18,19,1a,1b")
+    mkpack("nvidia-closed-580.178.04", "11,12,13,14")
+    mkpack("nvidia-closed-470.256.02", "e,f,10")
+    mkpack("nvidia-open-999.0", "1b,16", kernel="some-other-kernel")
+
+    def pick(a):
+        hit = nv_pack_for(a, pd)
+        return hit[1]["name"] if hit else None
+    check("Blackwell (0x1b) gets the open 610 driver, never a pack built for another kernel", pick(0x1B) == "nvidia-open-610.57.04", str(pick(0x1B)))
+    check("   ... Turing (0x16) gets the open 610 driver too", pick(0x16) == "nvidia-open-610.57.04", str(pick(0x16)))
+    check("   ... Pascal (0x13) and Maxwell (0x12) get the closed 580", pick(0x13) == pick(0x12) == "nvidia-closed-580.178.04")
+    check("   ... Kepler (0x0e, 0x10) gets the closed 470", pick(0x0E) == pick(0x10) == "nvidia-closed-470.256.02")
+    check("   ... Fermi (0x0c) gets none: nouveau only", pick(0x0C) is None, str(pick(0x0C)))
+    check("   ... an empty drivers folder picks nothing", nv_pack_for(0x1B, os.path.join(pd, "absent")) is None)
+
+    SECRETS.values.clear()
+    SECRETS.add("BOARDSN12345", "dmi")
+    t = MmioTrace("selftest")
+    t.raw, t.overrun = os.path.join(pd, "raw"), "0"
+    body = b"".join(b"R 4 %d.000 1 0x%x 0x%x 0x0 0\n" % (i, 0xFD000000 + i * 4, i) for i in range(200000))
+    with open(t.raw, "wb") as f:
+        f.write(body[:len(body) // 2] + b"MARK 0.0 BOARDSN12345\n" + body[len(body) // 2:])
+    t.size = os.path.getsize(t.raw)
+    r = t.save(1 << 30)
+    txt = lzma.decompress(open(os.path.join(OUT, r["file"]), "rb").read())
+    check("a driver trace is redacted before it is compressed", b"BOARDSN12345" not in txt and b"[REDACTED]" in txt)
+    check("   ... and decompresses to every line it counted", txt.count(b"\n") == r["lines"] == 200001, str(r["lines"]))
+    check("   ... and its raw text is gone from RAM", not os.path.exists(t.raw))
+    with open(t.raw, "wb") as f:
+        f.write(os.urandom(12 << 20))
+    t.size = 12 << 20
+    r = t.save(2 << 20)
+    blob = open(os.path.join(OUT, r["file"]), "rb").read()
+    try:
+        whole = len(lzma.decompress(blob)) > 0
+    except lzma.LZMAError:
+        whole = False
+    check("a trace over its budget is cut and is still a valid file", r["cut_for_budget"] and whole, "%s %s" % (r["cut_for_budget"], whole))
+    check("   ... over its budget by at most one chunk plus the dictionary, on data that does not compress",
+          len(blob) <= (2 << 20) + (4 << 20) + (1 << 20) + 65536, str(len(blob)))
+    before = blob
+    with open(os.path.join(OUT, r["file"]), "ab") as f:
+        f.write(b"BOARDSN12345")
+    redact_tree()
+    check("the tree redactor never edits a compressed trace (it was redacted as text)",
+          open(os.path.join(OUT, r["file"]), "rb").read() == before + b"BOARDSN12345")
+    shutil.rmtree(pd, ignore_errors=True)
+
+    # a NIC's MAC as the register value its driver reads (e1000e RAL0 for 52:54:00:12:34:56)
+    SECRETS.values.clear()
+    mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]
+    SECRETS.add("0x%x" % (mac[0] | mac[1] << 8 | mac[2] << 16 | mac[3] << 24), "mac")
+    pd = tempfile.mkdtemp()
+    t = MmioTrace("macsel")
+    t.raw, t.overrun = os.path.join(pd, "raw"), "0"
+    with open(t.raw, "wb") as f:
+        f.write(b"R 4 1.0 1 0xfebc5400 0x12005452 0x0 0\nR 4 1.1 1 0xfebc5404 0x80005634 0x0 0\n")
+    t.size = os.path.getsize(t.raw)
+    r = t.save(1 << 20)
+    txt = lzma.decompress(open(os.path.join(OUT, r["file"]), "rb").read())
+    check("a NIC's MAC read as a register value (0x12005452) is redacted in its trace", b"0x12005452" not in txt and b"[REDACTED]" in txt, str(txt[:60]))
+    shutil.rmtree(pd, ignore_errors=True)
 
     print("\n%d failed" % len(fails) if fails else "\nall checks passed")
     return 1 if fails else 0

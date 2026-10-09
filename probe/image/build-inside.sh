@@ -10,19 +10,24 @@ K=/tmp/k          # unpacked kernel package
 F=/tmp/f          # unpacked firmware packages
 P=/tmp/pkgs
 LABEL=PROBE1401
-rm -rf "$OUT" "$R" "$K" "$F" "$P"
+# only the image's own outputs: out/ also holds the NVIDIA packs and their downloads (build.sh nvpack)
+rm -rf "$OUT/usb" "$OUT/1401-probe.img" "$R" "$K" "$F" "$P"
 mkdir -p "$OUT/usb/EFI/BOOT" "$OUT/usb/boot/grub" "$OUT/usb/REPORTS" "$R" "$K" "$F" "$P"
 
 say() { printf '\n== %s\n' "$*"; }
 
 say "build tools"
 apk update -q
-apk add -q kmod cpio zstd grub grub-efi mtools dosfstools python3 coreutils sfdisk
+apk add -q kmod cpio zstd xz grub grub-efi mtools dosfstools python3 coreutils sfdisk
 cat /etc/alpine-release
 
 say "kernel + GPU firmware packages (fetched, not installed: linux-firmware is 1 GB+ we do not want)"
 cd "$P"
 apk fetch -q linux-lts linux-firmware-nvidia linux-firmware-amdgpu linux-firmware-i915 linux-firmware-xe linux-firmware-radeon
+# radio firmware: only for the opt-in radio pack under drivers/, never the image (trim.py radios picks by name)
+apk fetch -q linux-firmware-intel linux-firmware-rtw88 linux-firmware-rtw89 linux-firmware-rtlwifi linux-firmware-rtl_bt \
+	linux-firmware-rtl_nic linux-firmware-ath10k linux-firmware-ath11k linux-firmware-ath12k linux-firmware-qca \
+	linux-firmware-mediatek linux-firmware-brcm linux-firmware-cypress
 ls -1 *.apk
 tar -xzf linux-lts-*.apk -C "$K" 2>/dev/null
 for p in linux-firmware-*.apk; do tar -xzf "$p" -C "$F" 2>/dev/null; done
@@ -166,15 +171,49 @@ cp LICENSE "$OUT/usb/GPL-3.0.txt"
 mkdir -p "$OUT/usb/licenses/linux-firmware"
 cp docs/firmware-licenses/* "$OUT/usb/licenses/linux-firmware/"
 [ "$(ls "$OUT/usb/licenses/linux-firmware" | wc -l)" -eq 6 ] || { echo "error: firmware licence texts missing"; exit 1; }
+say "radio pack (opt-in Wi-Fi/Bluetooth/Ethernet trace; never in the image)"
+RS=/tmp/radios
+rm -rf "$RS" && mkdir -p "$RS"
+python3 probe/image/trim.py radios "$K" "$V" "$F/lib/firmware" "$RS"
+mkdir -p "$OUT/usb/drivers"
+(cd "$RS" && find . -type f ! -name SHA256SUMS | sort | xargs sha256sum > /tmp/sums && mv /tmp/sums SHA256SUMS)
+tar -C "$RS" -cf - . | xz -6 -T0 > "$OUT/usb/drivers/radios-$V.tar.xz"
+rm -rf "$RS"
+echo "  radios-$V.tar.xz ($(du -h "$OUT/usb/drivers/radios-$V.tar.xz" | cut -f1))"
+
+say "NVIDIA driver packs for the trace step (build.sh nvpack)"
+# not in the initramfs: the stick runs from RAM and these are ~200 MB; the probe unpacks only the one a card needs
+mkdir -p "$OUT/usb/drivers"
+NP=$(ls out/nvpack/nvidia-*.tar.xz 2>/dev/null | wc -l)
+if [ "$NP" -eq 0 ] && [ "${NM_ALLOW_NO_NVPACK:-}" != 1 ]; then
+	echo "error: no NVIDIA driver packs in out/nvpack (./build.sh nvpack, or NM_ALLOW_NO_NVPACK=1)"; exit 1
+fi
+for pk in out/nvpack/nvidia-*.tar.xz; do
+	[ -f "$pk" ] || continue
+	PV=$(tar -xJOf "$pk" ./pack.json | sed -n 's/.*"kernel": "\([^"]*\)".*/\1/p')
+	# a pack built for another kernel would refuse to load on every tester's PC: stop here instead
+	[ "$PV" = "$V" ] || { echo "error: $pk is built for kernel '$PV', the image is $V: rebuild with ./build.sh nvpack"; exit 1; }
+	cp "$pk" "$OUT/usb/drivers/"
+	echo "  $(basename "$pk") ($(du -h "$pk" | cut -f1))"
+done
+for f in out/nvpack/*.failed; do [ -f "$f" ] && echo "  NOT BUILT on $V: $(basename "$f" .failed) (its cards are traced with nouveau)"; done
+
 # GPL/other licenses travel with the binaries: every package in the image, its version, license and source
 {
 	cat docs/THIRD-PARTY-NOTICES.head.txt
 	echo; echo "PACKAGES IN THE SCANNER (Alpine Linux ${ALPINE:-3.24}, x86_64): name-version  {source package}  (license)"
 	cat /tmp/pkgs.txt
 	echo; echo "KERNEL: linux-lts $(ls "$R/lib/modules")  (GPL-2.0-only)"
+	echo; echo "HARDWARE COLLECTOR: Hardware-Sniffer by lzhoang2801, /usr/lib/1401-probe/hsniffer (BSD-3-Clause, text in that folder)"
+	for pk in "$OUT"/usb/drivers/nvidia-*.tar.xz; do
+		[ -f "$pk" ] || continue
+		echo; echo "NVIDIA DRIVER: drivers/$(basename "$pk")  NVIDIA Software License (licenses/LICENSE.nvidia inside the pack);"
+		echo "  binaries as shipped by NVIDIA, only the kernel interface compiled for this kernel. Open kernel modules: MIT/GPL-2.0."
+	done
 } > "$OUT/usb/THIRD-PARTY-NOTICES.txt"
 [ "$(grep -c '(GPL' "$OUT/usb/THIRD-PARTY-NOTICES.txt")" -ge 3 ] || { echo "error: THIRD-PARTY-NOTICES has no package licenses"; exit 1; }
-(cd "$OUT/usb" && sha256sum EFI/BOOT/BOOTX64.EFI boot/vmlinuz boot/initramfs.zst boot/grub/grub.cfg 1401-probe.marker > SHA256SUMS)
+(cd "$OUT/usb" && sha256sum EFI/BOOT/BOOTX64.EFI boot/vmlinuz boot/initramfs.zst boot/grub/grub.cfg 1401-probe.marker \
+	drivers/*.tar.xz > SHA256SUMS)
 
 say "raw disk image (for QEMU and for balenaEtcher/Rufus users)"
 KB=$(du -sk "$OUT/usb" | cut -f1)
@@ -187,7 +226,7 @@ mkfs.vfat -F 32 -n "$LABEL" /tmp/part.img >/dev/null
 export MTOOLS_SKIP_CHECK=1
 mcopy -s -i /tmp/part.img "$OUT/usb/EFI" "$OUT/usb/boot" "$OUT/usb/REPORTS" "$OUT/usb/licenses" "$OUT/usb/README.txt" \
       "$OUT/usb/LICENSE.txt" "$OUT/usb/GPL-3.0.txt" "$OUT/usb/THIRD-PARTY-NOTICES.txt" \
-      "$OUT/usb/1401-probe.marker" "$OUT/usb/SHA256SUMS" ::
+      "$OUT/usb/1401-probe.marker" "$OUT/usb/SHA256SUMS" "$OUT/usb/drivers" ::
 dd if=/tmp/part.img of="$OUT/1401-probe.img" bs=1M seek=1 conv=notrunc status=none
 rm -f /tmp/part.img
 

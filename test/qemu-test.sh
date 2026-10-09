@@ -26,7 +26,7 @@ python3 -c "open('$T/nvme.img','wb').truncate(256 << 20)"
 cat > "$T/grub.cfg" <<'EOF'
 set timeout=0
 menuentry "1401 Probe - QEMU test" {
-	linux /boot/vmlinuz rdinit=/init loglevel=4 efi=debug console=tty0 console=ttyS0,115200 consoleblank=0 snd_intel_dspcfg.dsp_driver=1 p1401.mode=test p1401.serial=1
+	linux /boot/vmlinuz rdinit=/init loglevel=4 efi=debug console=tty0 console=ttyS0,115200 consoleblank=0 snd_intel_dspcfg.dsp_driver=1 p1401.mode=test p1401.serial=1 p1401.radios=yes
 	initrd /boot/initramfs.zst
 }
 EOF
@@ -91,7 +91,8 @@ root = names[0].split("/")[0]
 rep = json.loads(z.read(root + "/report.json"))
 st = rep.get("stages", {})
 bad = {k: v for k, v in st.items() if v.get("status") != "ok"}
-check("all 11 stages ran and read ok", len(st) == 11 and not bad, bad or len(st))
+# 11 scan stages + full system map + build report + the opt-in radio stage this test says yes to
+check("all 14 stages ran and read ok", len(st) == 14 and not bad, bad or len(st))
 
 net0, net1 = rep.get("network", {}), rep.get("network_at_end", {})
 check("the only network interface at the start is lo", net0.get("interfaces") == ["lo"], net0)
@@ -99,6 +100,15 @@ check("the only network interface at the end is lo", net1.get("interfaces") == [
 nic = [d for d in rep.get("pci", []) if d.get("vendor") == "0x8086" and d.get("device") == "0x10d3"]
 check("sanity: the e1000e NIC is on the PCI bus", len(nic) == 1)
 check("   ... and no driver bound to it", bool(nic) and nic[0].get("driver") is None, nic and nic[0].get("driver"))
+# the opt-in radio step (p1401.radios=yes stands in for the person's Y): it may load e1000e from the stick's radio
+# pack, trace it, and must leave the machine exactly as offline as before
+rr = rep.get("radios", {})
+check("radio opt-in: consent recorded as the test's", rr.get("consent") == "test", rr.get("consent"))
+check("   ... e1000e came from the radio pack and was loaded", "e1000e" in rr.get("loaded", []), rr.get("loaded"))
+check("   ... its start-up was traced", any(r.get("name", "").startswith("radio-") and r.get("lines", 0) > 0
+                                          for r in rep.get("trace", {}).get("runs", [])), rep.get("trace"))
+check("   ... it was forced down the moment it appeared", all(v.get("offline") for v in rr.get("off_after", {}).values()) and rr.get("off_after"), rr.get("off_after"))
+check("   ... and nothing it loaded is left loaded", rr.get("left_loaded") == [], rr.get("left_loaded"))
 
 red = rep.get("redaction", {})
 hits = sum(red.get("hits", {}).values())

@@ -10,3 +10,5 @@ site/.dl/
 # Finder metadata lists folder contents; it never ships
 .DS_Store
 __pycache__/
+# internal triage log (user report ids, names): never in the public tree
+BUGS.md
