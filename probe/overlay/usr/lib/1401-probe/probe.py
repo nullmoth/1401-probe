@@ -44,6 +44,7 @@ import shutil
 import stat
 import shlex
 import struct
+import signal
 import subprocess
 import sys
 import threading
@@ -51,7 +52,7 @@ import time
 import traceback
 import zipfile
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 SCHEMA = "1401-probe/1"
 STICK_LABEL = "PROBE1401"
 MARKER = "1401-probe.marker"
@@ -1448,6 +1449,47 @@ DEBUGFS_KEEP = ("name", "amdgpu_firmware_info", "amdgpu_vbios", "amdgpu_discover
                 "i915_display_info", "i915_capabilities", "vbios.rom", "clients")
 
 
+# the hardware poweroff dead-man: a detached process armed before a step that can wedge the whole machine (a GPU
+# driver taking over the display and hanging). If the step returns, it is cancelled. If the machine soft-hangs it
+# fires, the PC turns off, and the already-saved report is the final state instead of a frozen black screen the user
+# waits on forever. A fully-wedged kernel cannot be saved from userspace; PREVENTION (boot_vga below) is what spares
+# the common case. selftest overrides DEADMAN_CMD so it never really powers a machine off.
+DEADMAN_CMD = "sleep %d; sync; /sbin/poweroff -f 2>/dev/null; echo 1 > /proc/sys/kernel/sysrq 2>/dev/null; printf o > /proc/sysrq-trigger 2>/dev/null"
+
+
+@contextlib.contextmanager
+def deadman(seconds, reason):
+    p = None
+    try:
+        p = subprocess.Popen(["/bin/sh", "-c", DEADMAN_CMD % seconds], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        REP.setdefault("deadman", []).append({"reason": reason, "seconds": seconds})
+        yield
+    finally:
+        if p is not None and p.poll() is None:
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+
+
+def boot_vga(bdf):
+    """True when firmware lit this PCI GPU as the boot display. A secondary dGPU (boot_vga=0) on a hybrid laptop
+    drives no panel, and loading a kernel-modesetting driver on it is what hangs (nouveau on a Max-Q), so it is
+    bound info-only instead."""
+    return (rd("/sys/bus/pci/devices/%s/boot_vga" % bdf) or "0").strip() == "1"
+
+
+def nouveau_args(boot_flags):
+    """modprobe args for nouveau given each NVIDIA GPU's boot_vga. When NO NVIDIA GPU is the boot display (a hybrid
+    laptop's dGPU), load info-only (modeset=0): it binds and exposes the chip without touching a display pipeline,
+    which is the exact path that hangs a muxless Max-Q. When one IS the boot display (a desktop driving the monitor),
+    load normally. Pure so the decision is tested without hardware."""
+    if boot_flags and not any(boot_flags):
+        return ["modprobe", "nouveau", "modeset=0"], True
+    return ["modprobe", "nouveau"], False
+
+
 def st_gpu_drivers():
     """Last and optional: load the real GPU driver to learn connectors, EDIDs, firmware and IP versions.
     This is the one step that can blank a screen, so it only runs after the safe report is on the stick."""
@@ -1458,11 +1500,16 @@ def st_gpu_drivers():
     for vid, first, second in (("0x10de", "nouveau", None), ("0x1002", "amdgpu", "radeon"), ("0x8086", "i915", "xe")):
         if vid not in vendors:
             continue
-        UI.say("    loading %s ..." % first)
+        args, info_only = ["modprobe", first], False
+        if first == "nouveau":
+            nv_bdfs = [g["bdf"] for g in REP.get("gpus", []) if g.get("vendor") == "0x10de"]
+            args, info_only = nouveau_args([boot_vga(b) for b in nv_bdfs])
+        UI.say("    loading %s%s ..." % (first, " (info only: not the boot display)" if info_only else ""))
         with step("driver:" + first) as go:
             tried.append(first if go else first + " (skipped: it froze a previous run)")
             if go:
-                sh("kernel/modprobe-%s.txt" % first, ["modprobe", first], 150)
+                with deadman(200, "modprobe " + first):  # a KMS takeover that wedges the display ends in poweroff
+                    sh("kernel/modprobe-%s.txt" % first, args, 150)
         unbound = [g["bdf"] for g in REP["gpus"] if g.get("vendor") == vid and not rdlink("/sys/bus/pci/devices/%s/driver" % g["bdf"])]
         if unbound and second:
             with step("driver:" + second) as go:
@@ -1656,15 +1703,22 @@ class MmioTrace:
             pass
 
     def _pump(self):
-        while not (self.stop.is_set() and self.idle >= 0.6):
-            r, _, _ = select.select([self.fd], [], [], 0.2)
+        # stops when told, never "when idle": on real hardware mmiotrace never goes quiet, so the idle-gated loop
+        # outlived its join and read a closed pipe (users' screens 10-09: EBADF / write to closed file)
+        while not self.stop.is_set():
             try:
+                r, _, _ = select.select([self.fd], [], [], 0.2)
                 chunk = os.read(self.fd, 1 << 20) if r else b""
             except BlockingIOError:
                 chunk = b""
+            except (OSError, ValueError):
+                return  # the pipe was closed under us: the trace so far is kept
             if chunk:
-                if self.size < self.cap:
-                    self.out.write(chunk[:self.cap - self.size])
+                try:
+                    if self.size < self.cap:
+                        self.out.write(chunk[:self.cap - self.size])
+                except ValueError:
+                    return
                 self.size += len(chunk)
                 self.idle = 0.0
             else:
@@ -1673,16 +1727,19 @@ class MmioTrace:
     def __exit__(self, *exc):
         # drain first: switching the tracer to nop throws away whatever the pipe still holds
         t0 = time.monotonic()
-        while self.idle < 1.0 and time.monotonic() - t0 < 20:
+        while self.idle < 1.0 and time.monotonic() - t0 < 5:  # a short drain; a busy device never goes quiet
             time.sleep(0.2)
         self.overrun = (re.search(r"overrun: (\d+)", rd(TRACE + "/per_cpu/cpu0/stats") or "") or [None, None])[1]
         # the pipe closes BEFORE the tracer changes: an open trace_pipe holds the tracer, and switching it then
         # fails with EBUSY (QEMU test, 10-08), which lost the trace AND left mmiotrace on with one CPU online
         self.stop.set()
-        self.th.join(30)
+        self.th.join(10)
         os.close(self.fd)
         self.out.close()
-        _tw(TRACE + "/current_tracer", "nop")
+        try:
+            _tw(TRACE + "/current_tracer", "nop")
+        except OSError as e:  # recorded, and the next trace's __enter__ sets nop again before anything else
+            self.nop_error = str(e)
         return False
 
     def save(self, budget):
@@ -1955,15 +2012,24 @@ def st_trace():
         except Exception as e:  # noqa: BLE001
             tr["errors"][meta["name"]] = "install: %s: %s" % (type(e).__name__, e)
             continue
-        sh("trace/rmmod-nouveau.txt", ["modprobe", "-r", "nouveau"], 60)
+        # unbind, not unload: nouveau usually drives the console, so `modprobe -r` refuses ("in use") and NVIDIA's
+        # driver then finds every card taken. A sysfs unbind releases the card even with the console on it.
+        held = [g["bdf"] for g in nv if rdlink("/sys/bus/pci/devices/%s/driver" % g["bdf"]) == "nouveau"]
+        for bdf in held:
+            try:
+                _tw("/sys/bus/pci/drivers/nouveau/unbind", bdf)
+            except OSError as e:
+                tr["errors"]["unbind-" + bdf] = str(e)
         fds = []
 
         def bring_up():
             sh("trace/%s-load.txt" % meta["name"], ["modprobe", "nvidia"], 120)
             fds.extend(nv_open_all())
-            sh("trace/%s-modeset.txt" % meta["name"], ["modprobe", "nvidia-drm", "modeset=1", "fbdev=0"], 120)
+            ms = "modeset=1" if any(boot_vga(g["bdf"]) for g in nv) else "modeset=0"  # no modeset on a no-panel dGPU
+            sh("trace/%s-modeset.txt" % meta["name"], ["modprobe", "nvidia-drm", ms, "fbdev=0"], 120)
             time.sleep(10)  # connectors are probed after the bind, and the heads are assigned then
-        run(meta["name"], bring_up)
+        with deadman(300, "nvidia trace " + meta["name"]):  # loading NVIDIA's own driver can wedge too
+            run(meta["name"], bring_up)
         for info in glob.glob("/proc/driver/nvidia/gpus/*/information"):
             save("trace/%s/%s.txt" % (meta["name"], info.split("/")[-2].replace(":", "_")), rd(info) or "")
         try:
@@ -1973,7 +2039,11 @@ def st_trace():
         for f in fds:
             os.close(f)
         sh("trace/%s-unload.txt" % meta["name"], ["modprobe", "-r", "nvidia-drm", "nvidia-modeset", "nvidia"], 120)
-        sh("trace/modprobe-nouveau-again.txt", ["modprobe", "nouveau"], 150)  # the console comes back for the last screen
+        for bdf in held:  # the console comes back for the last screen
+            try:
+                _tw("/sys/bus/pci/drivers/nouveau/bind", bdf)
+            except OSError as e:
+                tr["errors"]["rebind-" + bdf] = str(e)
     tr["budget_left"] = TRACE_LEFT[0]
     save("trace/trace.json", tr)
 
@@ -2401,6 +2471,50 @@ def selftest():
           open(os.path.join(OUT, r["file"]), "rb").read() == before + b"BOARDSN12345")
     shutil.rmtree(pd, ignore_errors=True)
 
+    # a trace that never goes quiet (real hardware) must still stop promptly, with no exception in its thread
+    global TRACE
+    saved_trace, td = TRACE, tempfile.mkdtemp()
+    TRACE = td
+    os.makedirs(os.path.join(td, "per_cpu", "cpu0"))
+    open(os.path.join(td, "per_cpu", "cpu0", "stats"), "w").write("overrun: 0\n")
+    rfd, wfd = os.pipe()
+    os.set_blocking(rfd, False)
+    flood = threading.Event()
+
+    def feed():
+        while not flood.is_set():
+            try:
+                os.write(wfd, b"R 4 1.0 1 0xfd000000 0x1 0x0 0\n" * 64)
+            except OSError:
+                return
+            time.sleep(0.01)
+    ft = threading.Thread(target=feed, daemon=True)
+    ft.start()
+    errs = []
+    old_hook = threading.excepthook
+    threading.excepthook = lambda a: errs.append(repr(a.exc_value))
+    try:
+        t = MmioTrace("flood")
+        t.raw = os.path.join(td, "raw")
+        t.fd, t.out, t.stop = rfd, open(t.raw, "wb"), threading.Event()
+        t.th = threading.Thread(target=t._pump, daemon=True)
+        t.th.start()
+        time.sleep(1.0)
+        t0 = time.monotonic()
+        t.__exit__(None, None, None)
+        took = time.monotonic() - t0
+        time.sleep(0.5)
+    finally:
+        flood.set()
+        threading.excepthook = old_hook
+        os.close(wfd)
+        TRACE = saved_trace
+    check("a trace that never goes quiet stops within 10 s", took < 10 and not t.th.is_alive(), "%.1f s" % took)
+    check("   ... with no exception in its reader thread (users saw EBADF / write to closed file)", not errs, errs)
+    check("   ... and keeps what it read", t.size > 0 and os.path.getsize(t.raw) > 0, str(t.size))
+    check("   ... and switches the tracer off", open(os.path.join(td, "current_tracer")).read() == "nop")
+    shutil.rmtree(td, ignore_errors=True)
+
     # a NIC's MAC as the register value its driver reads (e1000e RAL0 for 52:54:00:12:34:56)
     SECRETS.values.clear()
     mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]
@@ -2415,6 +2529,42 @@ def selftest():
     txt = lzma.decompress(open(os.path.join(OUT, r["file"]), "rb").read())
     check("a NIC's MAC read as a register value (0x12005452) is redacted in its trace", b"0x12005452" not in txt and b"[REDACTED]" in txt, str(txt[:60]))
     shutil.rmtree(pd, ignore_errors=True)
+
+    # boot-aware nouveau: a hybrid laptop's dGPU (no boot display) binds info-only; a desktop GPU driving the monitor loads normally
+    a_hyb, info_hyb = nouveau_args([False])
+    a_two, info_two = nouveau_args([False, False])
+    a_desk, info_desk = nouveau_args([True])
+    a_mix, info_mix = nouveau_args([True, False])
+    a_none, info_none = nouveau_args([])
+    check("a secondary-only NVIDIA (hybrid laptop) loads nouveau info-only (modeset=0)", a_hyb == ["modprobe", "nouveau", "modeset=0"] and info_hyb, str(a_hyb))
+    check("   ... two secondary NVIDIA GPUs, same", a_two == ["modprobe", "nouveau", "modeset=0"] and info_two)
+    check("a boot-display NVIDIA (desktop) loads nouveau normally", a_desk == ["modprobe", "nouveau"] and not info_desk, str(a_desk))
+    check("   ... a GPU that IS the boot display anywhere means a normal load", a_mix == ["modprobe", "nouveau"] and not info_mix)
+    check("   ... no NVIDIA GPU found means a plain load (nothing to be info-only about)", a_none == ["modprobe", "nouveau"] and not info_none)
+
+    # the dead-man: arms a detached poweroff, cancels it on normal exit, fires it on a hang
+    global DEADMAN_CMD
+    import tempfile as _tf
+    dmdir = _tf.mkdtemp()
+    fired = os.path.join(dmdir, "fired")
+    saved_cmd = DEADMAN_CMD
+    DEADMAN_CMD = "sleep %d; touch '" + fired + "'"
+    try:
+        with deadman(1, "selftest-cancel"):
+            pass  # returns at once -> the poweroff must be cancelled
+        time.sleep(2.0)
+        check("the dead-man is cancelled when the step returns", not os.path.exists(fired))
+        armed_ok = False
+        try:
+            with deadman(1, "selftest-hang"):
+                time.sleep(2.5)  # stands in for a wedged step; the detached poweroff fires at 1 s
+                armed_ok = os.path.exists(fired)
+        except Exception:
+            pass
+        check("the dead-man fires while a step is wedged", armed_ok)
+    finally:
+        DEADMAN_CMD = saved_cmd
+        shutil.rmtree(dmdir, ignore_errors=True)
 
     print("\n%d failed" % len(fails) if fails else "\nall checks passed")
     return 1 if fails else 0

@@ -43,7 +43,7 @@ a { color: var(--link); }
   </div>
 
   <p>1401 Probe scans your computer's hardware from a USB stick and saves one report. You upload the report at
-  <b>nullmothsystems.com</b>, and that tells us exactly what your hardware needs. It takes about 15 minutes.</p>
+  <b>nullmothsystems.com</b>, and that tells us exactly what your hardware needs. It takes about 30 minutes.</p>
 
   <div class="panel">
     <b>You need:</b> a USB stick of 1 GB or more that you don't need anything on (it gets erased), and this PC.
@@ -71,14 +71,18 @@ a { color: var(--link); }
       </table>
     </li>
     <li>Choose <b>1401 Probe - scan this computer</b> (it starts by itself after 5 seconds).</li>
+    <li>It asks once whether to include <b>Wi-Fi, Bluetooth and Ethernet</b>. Press <kbd>Y</kbd> within 30 seconds to
+      include them; any other key, or nothing, skips them. If you say yes, it loads only your chips' drivers for about a
+      minute, switches every radio off the moment it starts, and removes them again. It never goes online.</li>
   </ol>
 
   <h2>3 · Let it scan</h2>
   <ul>
-    <li>The scan takes about 2 to 8 minutes. The last step is a <b>graphics test</b>. The screen may flicker or go black for
-      up to 3 minutes. That's normal, so leave it running.</li>
+    <li>The scan takes about 5 to 20 minutes. The last steps are a <b>graphics test</b> and a <b>driver trace</b> that
+      watches each graphics and audio driver start (NVIDIA cards get NVIDIA's own driver). The screen may flicker or go
+      black for up to 10 minutes. That's normal, so leave it running.</li>
     <li>When it says <b class="ok">DONE</b>, the report is saved on the stick and the computer <b>turns itself off</b>.</li>
-    <li>If nothing happens for 5 minutes, hold the power button. Your report is already saved up to that point.
+    <li>If nothing happens for 15 minutes, hold the power button. Your report is already saved up to that point.
       Then start the stick again and pick the normal scan. It remembers the step that froze, skips only that step,
       and finishes the rest.</li>
     <li>If it freezes a second time, pick <b>safe scan</b> at the menu. It skips the graphics test.</li>

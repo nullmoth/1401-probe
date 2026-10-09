@@ -2,6 +2,18 @@
 
 Every release stays up, on nullmothsystems.com/probe and on the GitHub releases page, with its SHA-256.
 
+## 2.0.1 - 2026-10-09
+
+Fixes the errors some of you saw on 2.0.0. If you made a 2.0.0 stick, make it again with 2.0.1.
+
+- **Driver trace errors fixed.** On 2.0.0 the last step printed "Bad file descriptor" / "write to closed file"
+  errors and stalled for about a minute per device. The trace reader now stops cleanly.
+- **NVIDIA's own driver now actually loads in the trace.** 2.0.0 tried to unload nouveau while it was driving the
+  screen, which fails, so the NVIDIA trace recorded nothing. The card is now handed over directly.
+- Instructions everywhere (site, stick, Windows app) match what the scan does: the Wi-Fi/Bluetooth question at the
+  start, about 5 to 20 minutes, a black screen of up to 10 minutes near the end.
+- New: `1401-probe-linux.py` makes the stick from Linux and finds your report afterwards.
+
 ## 2.0.0 - 2026-10-08
 
 The probe now maps the whole machine, down to how each driver talks to its hardware, so the installer can build the

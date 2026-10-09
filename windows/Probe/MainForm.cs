@@ -145,10 +145,11 @@ namespace Probe1401
             Text_("This app makes a USB stick that scans your computer's hardware (processor, motherboard, " +
                   "graphics card, Wi-Fi and Bluetooth chips, sound, USB ports and firmware) and saves one report file " +
                   "back to the stick.");
-            Text_("The scanner runs on its own, offline. It has no network drivers, locks every drive except its own " +
+            Text_("The scanner runs on its own, offline. It starts with no network drivers (it asks before it ever loads " +
+                  "Wi-Fi, Bluetooth or Ethernet drivers, and never goes online), locks every drive except its own " +
                   "stick read-only, and removes serial numbers before it saves anything. You upload the report yourself " +
                   "at nullmothsystems.com.");
-            Text_("You need: a USB stick of 1 GB or more whose contents you don't need, and about 10 minutes.", true);
+            Text_("You need: a USB stick of 1 GB or more whose contents you don't need, and about 30 minutes.", true);
             Btn("Make the scanner USB stick  ›", (s, e) => Checks());
             Btn("I already scanned - find my report  ›", (s, e) => ReportPage());
             var docs = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0, 6, 0, 0) };
@@ -312,8 +313,10 @@ namespace Probe1401
                 : key.StartsWith("F") ? "Press " + key + " repeatedly as the computer starts to open its boot menu, "
                 : "Open the boot menu (" + key + "), ";
             Text_("2.  Leave the stick plugged in and restart. " + how + "and pick the USB stick marked UEFI.");
-            Text_("3.  Pick \"1401 Probe - scan this computer\". It takes 2 to 8 minutes. The last step tests the graphics " +
-                  "card and the screen may go black for up to 3 minutes. Leave it running. It turns the computer off by itself.");
+            Text_("3.  Pick \"1401 Probe - scan this computer\". It asks once whether to include Wi-Fi, Bluetooth and " +
+                  "Ethernet (press Y within 30 seconds, or nothing for no). The scan takes about 5 to 20 minutes. The last " +
+                  "steps test the graphics card and the screen may go black for up to 10 minutes. Leave it running. If " +
+                  "nothing happens for 15 minutes, hold the power button. It turns the computer off by itself.");
             Text_("4.  Put your settings back: turn Secure Boot back ON in BIOS setup (Del or F2 as it starts), then start " +
                   "Windows, open 1401 Probe, and click \"I already scanned - find my report\".", true);
             Btn("Restart now and pick the USB stick (Use a device)", (s, e) => Restart("/r /o /t 0",

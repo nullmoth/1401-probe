@@ -216,7 +216,11 @@ def make_stick():
     step(4, "Start the PC from the stick")
     say("  1. Restart. Open the BIOS setup (usually Del or F2 while it starts).")
     say("  2. Turn Secure Boot OFF (the scanner is not signed by Microsoft) and pick the USB stick to boot from.")
-    say("  3. The scan runs by itself and turns the PC off when it is done. It never touches your drives.")
+    say("  3. Pick \"1401 Probe - scan this computer\". It asks once whether to include Wi-Fi, Bluetooth and Ethernet")
+    say("     (press Y within 30 seconds, or nothing for no; it never goes online). The scan takes about 5 to 20 minutes;")
+    say("     near the end the screen may go black for up to 10 minutes. If nothing happens for 15 minutes, hold the")
+    say("     power button and start the stick again: it skips the step that froze. It turns the PC off when done,")
+    say("     and it never touches your drives.")
     say("  4. Back in Linux, plug the stick in and run:  python3 %s --report" % os.path.basename(__file__))
     say("  5. Turn Secure Boot back on if you use it.")
 
