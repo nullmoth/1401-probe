@@ -38,6 +38,10 @@ echo "payload: $(du -sh "$stage/payload" | cut -f1), $(find "$stage/payload" -ty
 scan() {  # prints the count of identifying strings in $1, never the strings: a hit is the name
 	# a scan that cannot read its file must stop the build, never count 0 (under set -e, c=$(scan ...) exits here)
 	local s; s=$(strings -a -e l "$1" && strings -a "$1") || { echo "error: strings could not read $1" >&2; exit 1; }
+	# the release scan also greps the raw bytes (LC_ALL=C); a name fragment can sit in compressed noise where strings
+	# does not report it, so the installer (scan $f raw) is repacked until it is clean under both
+	local raw=0
+	[ "${2:-}" != raw ] || [ -z "${NM_PRIVATE_RE:-}" ] || raw=$(LC_ALL=C grep -oaiE "$NM_PRIVATE_RE" "$1" | wc -l | tr -d ' ')
 	# the one upstream path allowed through, stripped as an exact literal so the rest of its line is still scanned:
 	# Alpine builds every package as user "buildozer", and its GRUB (payload/EFI/BOOT/BOOTX64.EFI) carries 335
 	# "/home/buildozer/aports/main/grub/src/..." source paths. That is Alpine's builder, not ours. Any other
@@ -48,7 +52,7 @@ scan() {  # prints the count of identifying strings in $1, never the strings: a 
 	local p n=0
 	p=$(printf '%s\n' "$s" | grep -c -E "/Users/|/home/|\.pdb|\.PDB" || true)
 	[ -z "${NM_PRIVATE_RE:-}" ] || n=$(printf '%s\n' "$s" | grep -c -i -E "$NM_PRIVATE_RE" || true)
-	echo $((p + n))
+	echo $((p + n + raw))
 }
 n=0
 while IFS= read -r -d '' f; do
@@ -59,7 +63,7 @@ nonce_file="$PWD/out/windows/pack-nonce.txt"
 for nonce in $(seq 1 40); do
 	printf '1401 Probe %s packing nonce %s\n' "$VERSION" "$nonce" > "$nonce_file"
 	makensis -V2 -DVERSION="$VERSION" -DSTAGE="$PWD/$stage" -DNONCE="$nonce_file" -DOUT="$PWD/out/windows/1401-Probe-Setup.exe" windows/installer.nsi
-	n=$(scan out/windows/1401-Probe-Setup.exe)
+	n=$(scan out/windows/1401-Probe-Setup.exe raw)
 	[ "$n" -eq 0 ] && break
 	echo "packing nonce $nonce: $n chance fragment(s) in the compressed stream, repacking"
 done
