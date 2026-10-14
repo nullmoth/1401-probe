@@ -125,8 +125,12 @@ find_report() {
 }
 
 # Text from this Mac loses what identifies it or its owner: serial numbers, UUIDs, network and Bluetooth
-# addresses, the Wi-Fi networks it knows, the names of paired devices, and the Mac's and the user's names.
+# addresses, the Wi-Fi networks it knows and their passwords, the names of paired devices, and the Mac's and the
+# user's names.
 # $1 = file. Lists under the headings in the awk below are dropped whole (they name networks and other people's devices).
+# itlwm and AirportItlwm (Intel Wi-Fi on a Mothintosh) can carry the network name and password in their Info.plist as
+# "WiFiConfig", which ioreg prints on the Wi-Fi card's PCI entry; the registry root's "IOConsoleUsers" names the
+# logged-in user (short and full name). Both values go whole, as do password and network-name keys anywhere else.
 scrub_file() {
 	local f=$1 t="$1.t" n q u
 	LC_ALL=C awk '
@@ -138,6 +142,9 @@ scrub_file() {
 		-e 's/("IOPlatform(UUID|SerialNumber)" = )"[^"]*"/\1"(removed)"/' \
 		-e 's/("[A-Za-z -]*(Serial|UUID|UDID)[A-Za-z ]*" ?= ?)("[^"]*"|<[0-9A-Fa-f]*>|[0-9]+)/\1"(removed)"/g' \
 		-e 's/("(serial-number|board-id-serial|IOPlatformSerialNumber|kUSBSerialNumberString|USB Serial Number|Serial Number|SerialNumber|IOMACAddress|BD_ADDR|BluetoothDeviceAddress|LocalAddress|IOBluetoothHostControllerAddress)" = ).*/\1(removed)/' \
+		-e 's/("(WiFiConfig|IOConsoleUsers)" = ).*/\1(removed)/' \
+		-e 's/("(password|Password|passwd|passphrase|psk|PSK|ssid|SSID|bssid|BSSID)" ?= ?).*/\1(removed)/' \
+		-e 's/("kCG[A-Za-z]*UserName[A-Za-z]*" ?= ?).*/\1(removed)/' \
 		-e 's/^([[:space:]]*[^:]*(Serial|UUID|UDID)[^:]*:).*/\1 (removed)/' \
 		-e 's/^([[:space:]]*(UID|Address|MAC Address|Ethernet Address|Wi-Fi Address|Bluetooth Address|SSID|BSSID|Network Name)[^:]*:).*/\1 (removed)/' \
 		-e 's/(^|[^0-9A-Fa-f:])([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}([^0-9A-Fa-f:]|$)/\1XX:XX:XX:XX:XX:XX\3/g' \
@@ -241,11 +248,16 @@ selftest() {
 		"    Other Local Wi-Fi Networks:" "        Neighbours:" "Bluetooth Controller:" "    Chipset: BCM_4364B3" "    Address: A4:83:E7:12:34:57" \
 		"    Connected:" "        Jane's AirPods:" "          Address: 11:22:33:44:55:66" "    Not Connected:" "        Jane's Keyboard:" \
 		"Serial Number (system): C02XYZ12345" '    "IOPlatformSerialNumber" = "C02XYZ12345"' '    "IOMACAddress" = <a483e7123456>' '      "VolGroupUUID" = "ECE575C2-96B8-422D-8655-3DFAA72AB0E0"' '  |   "Device Characteristics" = {"Serial Number"="204370802915","Product Name"="WDC PC SN530"}' \
-		"Computer Name: Jane-MacBook" "          Display Serial Number: 2IV0171002681" "$h/jane/Library/x" "Hardware UUID: 01234567-89AB-CDEF-0123-456789ABCDEF" > "$d/t.txt"
+		"Computer Name: Jane-MacBook" "          Display Serial Number: 2IV0171002681" "$h/jane/Library/x" "Hardware UUID: 01234567-89AB-CDEF-0123-456789ABCDEF" \
+		'    |   "IOModel" = "Intel Wireless Card"' '    |   "WiFiConfig" = {"WiFi_1"={"password"="hunter2-at-home","ssid"="JaneHome@5G"}}' \
+		'  |   "IOConsoleUsers" = ({"kCGSSessionUserNameKey"="jane","kCGSessionLongUserNameKey"="Jane Appleseed","kCGSSessionIDKey"=257})' \
+		'      "Networks" = ({"ssid"="CafeGuest","psk"="letmein99"})' > "$d/t.txt"
 	scrub_file "$d/t.txt"
 	if grep -qiE "a4:83:e7|C02XYZ|2IV0171|ECE575C2|204370802915|a483e7|HomeNetwork|Neighbours|AirPods|Keyboard|11:22:33|Jane-MacBook|$h/jane|01234567-89AB" "$d/t.txt"; then r=1; else r=0; fi
 	check "the scan drops serials, addresses, Wi-Fi networks, paired devices and names" "$r"
-	if grep -q 'Firmware Version: wl0' "$d/t.txt" && grep -q 'Chipset: BCM_4364B3' "$d/t.txt" && grep -q 'Product Name"="WDC PC SN530' "$d/t.txt" && grep -q 'Card Type: Wi-Fi  (0x14E4, 0x7BF)' "$d/t.txt"; then r=0; else r=1; fi
+	if grep -qE 'hunter2|JaneHome|CafeGuest|letmein99|Appleseed|UserNameKey"="jane' "$d/t.txt"; then r=1; else r=0; fi
+	check "the scan drops Wi-Fi passwords kept by a Wi-Fi kext and the logged-in user's names" "$r"
+	if grep -q 'Firmware Version: wl0' "$d/t.txt" && grep -q 'Chipset: BCM_4364B3' "$d/t.txt" && grep -q 'Product Name"="WDC PC SN530' "$d/t.txt" && grep -q 'Card Type: Wi-Fi  (0x14E4, 0x7BF)' "$d/t.txt" && grep -q '"IOModel" = "Intel Wireless Card"' "$d/t.txt"; then r=0; else r=1; fi
 	check "the scan keeps the Wi-Fi card, its firmware and the Bluetooth chipset" "$r"
 	if grep -q '^Bluetooth Controller:' "$d/t.txt" && grep -q '(list removed)' "$d/t.txt"; then r=0; else r=1; fi
 	check "a dropped list says so, and the next section survives it" "$r"
